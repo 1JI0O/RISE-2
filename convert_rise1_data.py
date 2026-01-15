@@ -90,7 +90,9 @@ def convert_episodes():
 
     # 扫描所有 scene 文件夹
     demos = [d for d in os.listdir(SRC_TRAIN) if os.path.isdir(os.path.join(SRC_TRAIN, d))]
-    
+    demos = demos[:3]
+    # test
+
     for demo_name in tqdm(demos):
         src_demo = os.path.join(SRC_TRAIN, demo_name)
         dst_demo = os.path.join(DST_TRAIN, demo_name)
