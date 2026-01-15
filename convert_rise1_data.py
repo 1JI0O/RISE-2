@@ -188,14 +188,8 @@ def convert_episodes():
                     gripper_left[0] = grip_val
 
                     rise2_dict = {
-                        'robot_left': robot_left,
-                        'gripper_left': gripper_left,
-
-                        # 以下数据都用不到，为了格式正确，全部填充0
-                        'airexo_left': np.zeros(8, dtype=np.float32),
-                        'robot_right': np.zeros(33, dtype=np.float32),
-                        'gripper_right': np.zeros(2, dtype=np.float32),
-                        'airexo_right': np.zeros(8, dtype=np.float32)
+                        'robot': robot_left,
+                        'gripper': gripper_left,
                     }
 
                     # 都保存到 lowdim 目录
