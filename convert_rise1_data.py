@@ -147,6 +147,8 @@ def convert_episodes():
 
         # rise1数据中，inhand和global相机都有tcp和gripper_command，时间戳还不一样
         # 按照dataset逻辑，需要都转化成一个对应的npy
+
+        # 不对，这个有大问题，需要修改！
         
         for cam_id in [GLOBAL_CAM_ID, INHAND_CAM_ID]:
             src_tcp_dir = os.path.join(src_demo, f"cam_{cam_id}", "tcp")
