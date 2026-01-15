@@ -10,6 +10,7 @@ class ProjectorBase:
     def project_tcp_to_camera_coord(self, tcp, rotation_rep = "quaternion", rotation_rep_convention = None):
         tcp = mat_to_xyz_rot(
             np.linalg.inv(self.camera_pose) @ xyz_rot_to_mat(
+                # 这个地方可能有点问题（存疑）
                 tcp,
                 rotation_rep = rotation_rep,
                 rotation_rep_convention = rotation_rep_convention
@@ -54,6 +55,7 @@ class SingleArmProjector:
                 self.depth_scales[cam_serial] = 1000.
 
         self.projector = ProjectorBase(np.linalg.inv(self.calib_file["camera_to_robot"][global_cam_serial]))
+        # 结合上面 ProjectorBase 的定义，这里可能inv了两次？
 
     def project_tcp_to_camera_coord(self, tcp, rotation_rep = "quaternion", rotation_rep_convention = None):
         tcp = self.projector.project_tcp_to_camera_coord(tcp, rotation_rep, rotation_rep_convention)
