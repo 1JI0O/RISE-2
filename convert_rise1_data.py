@@ -155,9 +155,10 @@ def convert_episodes():
             if not os.path.exists(src_tcp_dir): 
                 tqdm.write(f"[MISSING] tcp目录不存在: {src_tcp_dir}")
                 continue
-
-            for fname in os.listdir(src_tcp_dir):
-                if not fname.endswith('.npy'): continue
+            
+             # --- 在这里增加一个内部进度条 ---
+            fnames = [f for f in os.listdir(src_tcp_dir) if f.endswith('.npy')]
+            for fname in tqdm(fnames, desc=f"      Lifting lowdim (Cam {cam_id})", leave=False):
 
                 try:
                     tcp_raw = np.load(os.path.join(src_tcp_dir, fname))  # 13维
