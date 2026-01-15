@@ -86,7 +86,7 @@ class DINOEncoder(nn.Module):
         super().__init__()
         assert finetune in ["full", "lora", "none"], "finetune parameter should be one of [full, lora, none]."
         
-        dino = AutoModel.from_pretrained(os.path.join("./weights", name), dtype = dtype)
+        dino = AutoModel.from_pretrained(os.path.join("./weights", name), torch_dtype = dtype)
         self.num_register_tokens = 0 if name.startswith("dinov2") else dino.config.num_register_tokens
 
         if finetune == "lora":
