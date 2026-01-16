@@ -149,6 +149,16 @@ def convert_episodes():
         dst_lowdim = os.path.join(dst_demo, "lowdim")
         if not os.path.exists(dst_lowdim): os.makedirs(dst_lowdim)
 
+        # 获取所有存在的图片时间戳，做成一个 Set 集合，查询速度快
+        # 注意：这里需要去 dst_demo 里面看，因为刚才已经做过软链接了
+        img_dir = os.path.join(dst_demo, f"cam_{GLOBAL_CAM_ID}", "color")
+        if os.path.exists(img_dir):
+            # 获取所有 .png 的文件名，去掉 .png 后缀，存入 set
+            valid_img_timestamps = set(f[:-4] for f in os.listdir(img_dir) if f.endswith('.png'))
+        else:
+            valid_img_timestamps = set()
+            print(f"[Warning] 没找到图片目录: {img_dir}")
+
         # rise1数据中，inhand和global相机的时间戳没对齐
         # 研究样例teleop数据，发现只有主相机目录，那就不要inhand了
         
@@ -161,9 +171,17 @@ def convert_episodes():
                 tqdm.write(f"[MISSING] tcp目录不存在: {src_tcp_dir}")
                 continue
             
+            count_skipped = 0
+
              # --- 在这里增加一个内部进度条 ---
             fnames = [f for f in os.listdir(src_tcp_dir) if f.endswith('.npy')]
             for fname in tqdm(fnames, desc=f"      Lifting lowdim (Cam {cam_id})", leave=False):
+
+                timestamp = fname[:-4]
+                # 如果这个时间戳没有对应的图片，直接跳过！
+                if timestamp not in valid_img_timestamps:
+                    count_skipped += 1
+                    continue
 
                 try:
                     tcp_raw = np.load(os.path.join(src_tcp_dir, fname))  # 13维
@@ -202,6 +220,9 @@ def convert_episodes():
 
                 except Exception as e:
                     tqdm.write(f"  [Error] Lowdim 失败 {fname} (Cam {cam_id}): {e}")
+                    
+            if count_skipped > 0:
+                tqdm.write(f"  [Info] 在 {demo_name} 中跳过了 {count_skipped} 个只有 TCP 没有图片的坏数据")
 
 
 if __name__ == "__main__":
