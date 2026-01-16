@@ -63,7 +63,10 @@ def convert_calibration():
                 'type': 'robot',
                 'camera_serials': [GLOBAL_CAM_ID, INHAND_CAM_ID],
                 'camera_serials_global': [GLOBAL_CAM_ID],
-                'camera_serial_inhand': INHAND_CAM_ID, 
+                'camera_serial_inhand': INHAND_CAM_ID,
+                # dataset通过读取标定npy来获得相机序列，cam_ids = calib_file["camera_serials_global"]
+
+                # 'camera_serial_inhand': None, 
                 
                 'intrinsics': intrinsics_processed,
                 
@@ -122,7 +125,8 @@ def convert_episodes():
             json.dump(meta_content, f, indent=4)
 
         # 链接图片 (Cam文件夹)
-        for cam_id in [GLOBAL_CAM_ID, INHAND_CAM_ID]:
+        # for cam_id in [GLOBAL_CAM_ID, INHAND_CAM_ID]:
+        for cam_id in [GLOBAL_CAM_ID]:
             src_cam = os.path.join(src_demo, f"cam_{cam_id}")
             dst_cam = os.path.join(dst_demo, f"cam_{cam_id}")
             
@@ -145,12 +149,11 @@ def convert_episodes():
         dst_lowdim = os.path.join(dst_demo, "lowdim")
         if not os.path.exists(dst_lowdim): os.makedirs(dst_lowdim)
 
-        # rise1数据中，inhand和global相机都有tcp和gripper_command，时间戳还不一样
-        # 按照dataset逻辑，需要都转化成一个对应的npy
-
-        # 不对，这个有大问题，需要修改！
+        # rise1数据中，inhand和global相机的时间戳没对齐
+        # 研究样例teleop数据，发现只有主相机目录，那就不要inhand了
         
-        for cam_id in [GLOBAL_CAM_ID, INHAND_CAM_ID]:
+        # for cam_id in [GLOBAL_CAM_ID, INHAND_CAM_ID]:
+        for cam_id in [GLOBAL_CAM_ID]:
             src_tcp_dir = os.path.join(src_demo, f"cam_{cam_id}", "tcp")
             src_grip_dir = os.path.join(src_demo, f"cam_{cam_id}", "gripper_command")
 
@@ -168,7 +171,7 @@ def convert_episodes():
 
                     if os.path.exists(grip_path):
                         grip_raw = np.load(grip_path)
-                        # 归一化示例：将 0-1000 映射到 0-0.095米
+                        # 将 0-1000 映射到 0-0.095米，和rise1的realworld里decode_gripper_width一致
                         grip_val = float(grip_raw[0]) / 1000.0 * 0.095
                     else:
                         tqdm.write(f"[MISSING] grip文件不存在: {grip_path}")
