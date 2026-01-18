@@ -54,7 +54,8 @@ class SingleArmProjector:
             else:
                 self.depth_scales[cam_serial] = 1000.
 
-        self.projector = ProjectorBase(np.linalg.inv(self.calib_file["camera_to_robot"][global_cam_serial]))
+        # self.projector = ProjectorBase(np.linalg.inv(self.calib_file["camera_to_robot"][global_cam_serial]))
+        self.projector = ProjectorBase(self.calib_file["camera_to_robot"][global_cam_serial])
         # 结合上面 ProjectorBase 的定义，这里可能inv了两次？
 
     def project_tcp_to_camera_coord(self, tcp, rotation_rep = "quaternion", rotation_rep_convention = None):

@@ -30,8 +30,8 @@ def pose7d_to_matrix_forced_down(pose_7d):
     原始数据: [..., q0, q1, q2, q3]
     其中 q2=0.999 (index 6 in raw data).
     
-    解释为 [w, x, y, z] -> y=1 -> 绕 Y 轴转 180 -> Z 轴朝下 (正确!)
-    Scipy 需要 [x, y, z, w]
+    解释为 [w, x, y, z] -> y=1 -> 绕 Y 轴转 180 -> Z 轴朝下 
+    scipy.spatial.transform 需要 [x, y, z, w]
     """
     pose_7d = np.array(pose_7d).flatten()
     t = pose_7d[:3]

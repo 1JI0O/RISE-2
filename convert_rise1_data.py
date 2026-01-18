@@ -204,7 +204,7 @@ def convert_episodes():
                     """
 
                     robot_left = np.zeros(33, dtype=np.float32)
-                    robot_left[:7] = tcp_raw[:7] # 前7位是[x,y,z,qx,qy,qz,qw]
+                    robot_left[:7] = tcp_raw[:7]
 
                     # dataset读取逻辑 : 只读取第一个数，所以剩余的可以都填充0
                     gripper_left = np.zeros(2, dtype=np.float32)
@@ -226,7 +226,7 @@ def convert_episodes():
 
 
 if __name__ == "__main__":
-    convert_calibration()
+    # convert_calibration()
     convert_episodes()
     print(f"\n[Success] 数据已转换至: {DST_ROOT}")
     print("请在 Config 中设置 data_path 指向此路径，并将 robot_type 设为 single")
