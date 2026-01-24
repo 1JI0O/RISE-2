@@ -197,18 +197,28 @@ def convert_episodes():
 
                     # 构造 RISE-2 标准 33(robot) + 2(gripper) 字典
 
-                    """
-                    在 Dataset 中, self.robot_type 会决定 load_action 只取 robot_left 还是两个都取
-                    如果是单臂, load_action 会从这个字典里抽取出 robot_left[:7] 和 gripper_left[0]
-                    拼成一个长度为 8 的向量传给 getitem
-                    """
+                    # 参考 dataset/data_utils.py 以及 realworld.py 中 __getitem__ actions 部分
 
+                    # action = load_action(lowdim_dir, frame_id, self.robot_type, gripper_info_type = "command")
+
+                    # gripper_info_idx = 0 if gripper_info_type == "state" else 1
+                    # if robot_type == "single":
+                    #     tcp = lowdim_dict["robot"][0:7]
+                    #     gripper_command = lowdim_dict["gripper"][gripper_info_idx: gripper_info_idx + 1]
+                    #     action = np.concatenate([tcp, gripper_command])
+
+                    # 可见 gripper_command 需要被放在 idx:1
+
+                    
                     robot_left = np.zeros(33, dtype=np.float32)
                     robot_left[:7] = tcp_raw[:7]
 
                     # dataset读取逻辑 : 只读取第一个数，所以剩余的可以都填充0
                     gripper_left = np.zeros(2, dtype=np.float32)
+
                     gripper_left[0] = grip_val
+                    gripper_left[1] = grip_val
+                    # 为了保险，两位都填上
 
                     rise2_dict = {
                         'robot': robot_left,

@@ -60,10 +60,13 @@ class SingleArmAgent:
     def ready_pose(self):
         return np.array([0.5, 0, 0.17, 0, 0, 1, 0], dtype=np.float32)
 
+    # 获取相机观察到的
     def get_global_observation(self):
         _, colors, depths = self.camera.get_rgbd_images()
         return colors, depths
     
+    # 获取机器人当前状态（本体感知），tcp 和夹爪宽度
+    # 机械臂相关东西在 arm.py
     def get_proprio(self, rotation_rep = "rotation_6d", rotation_rep_convention = None, with_joint = False):
         tcp_pose = self.robot.get_tcp_pose()
         tcp_pose = xyz_rot_transform(

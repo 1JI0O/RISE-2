@@ -11,9 +11,26 @@ from easydict import EasyDict as edict
 from utils.training import set_seed
 from utils.ensemble import EnsembleBuffer
 from remote_eval import WebsocketClientPolicy
-from eval_agent import SingleArmAgent, DualArmAgent
+# from eval_agent import SingleArmAgent, DualArmAgent
 from dataset.data_utils import resize_image, ImageProcessor
 from dataset.projector import SingleArmProjector, DualArmProjector
+
+import cv2
+
+# test_color = "/data/haoxiang/realdata_rise2_ready/train/task_0014_user_0020_scene_0001_cfg_0001/cam_104122063550/color/1765000020748.png"
+# test_depth = "/data/haoxiang/realdata_rise2_ready/train/task_0014_user_0020_scene_0001_cfg_0001/cam_104122063550/depth/1765000020748.png"
+
+
+test_color = "/home/haoxiang/RISE-2/saved_test_data/color_0000.png"
+test_depth = "/home/haoxiang/RISE-2/saved_test_data/depth_0000.png"
+
+fake_intrinsics = np.array([
+    [914.81946,   0.0,      630.6389 ],
+    [0.0,         913.88464, 352.51572],
+    [0.0,         0.0,       1.0     ]
+])
+
+fake_depth_scale = 1000.0
 
 
 default_args = edict({
@@ -24,6 +41,24 @@ default_args = edict({
     "host": "127.0.0.1",
     "port": 8000
 })
+
+def load_test_obs(color_path, depth_path):
+    # 1. 加载彩色图并转为 RGB (OpenCV 默认读入是 BGR)
+    color_image = cv2.imread(color_path)
+    if color_image is None:
+        raise ValueError(f"无法加载图片: {color_path}")
+    color_image = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB).astype(np.uint8)
+
+    # 2. 加载深度图
+    # 注意：必须使用 cv2.IMREAD_UNCHANGED 才能保留 16bit 深度信息
+    depth_image = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+    if depth_image is None:
+        raise ValueError(f"无法加载深度图: {depth_path}")
+    
+    # 确保是 uint16。如果你的 PNG 是 8bit 的，需要根据量化比例转回 uint16 (通常单位是毫米)
+    depth_image = depth_image.astype(np.uint16)
+
+    return color_image, depth_image
 
 
 def create_point_cloud(colors, depths, intrinsics, config, depth_scale = 1000.0, rescale_factor = 1):
@@ -198,8 +233,8 @@ def evaluate(args_override):
     )
 
     # evaluation
-    Agent = SingleArmAgent if config.robot_type == "single" else DualArmAgent
-    agent = Agent(**config.deploy.agent)
+    # Agent = SingleArmAgent if config.robot_type == "single" else DualArmAgent
+    # agent = Agent(**config.deploy.agent)
 
     # ensemble buffer
     ensemble_buffer = EnsembleBuffer(mode = config.deploy.ensemble_mode)
@@ -212,19 +247,24 @@ def evaluate(args_override):
         for t in range(config.deploy.max_steps):
             if t % config.deploy.num_inference_steps == 0:
                 # pre-process inputs
-                colors, depths = agent.get_global_observation()
+                # colors, depths = agent.get_global_observation()
+
+                colors, depths = load_test_obs(test_color, test_depth)
                 # create cloud inputs
                 coords, points, cloud = create_input(
                     colors,
                     depths,
-                    cam_intrinsics = agent.intrinsics,
+                    # cam_intrinsics = agent.intrinsics,
+                    cam_intrinsics = fake_intrinsics,
                     config = config,
-                    depth_scale = agent.camera.depth_scale,
+                    # depth_scale = agent.camera.depth_scale,
+                    depth_scale = fake_depth_scale,
                     rescale_factor = 1.0
                 )
 
                 # create image inputs
-                image_coords = image_processor.get_image_coordinates(depths, agent.intrinsics, agent.camera.depth_scale)        
+                # image_coords = image_processor.get_image_coordinates(depths, agent.intrinsics, agent.camera.depth_scale)     
+                image_coords = image_processor.get_image_coordinates(depths, fake_intrinsics, fake_depth_scale)   
                 colors, image_coords = image_processor.preprocess_images(colors, image_coords)
 
                 # predict action
@@ -283,11 +323,15 @@ def evaluate(args_override):
             
             # get step action from ensemble buffer
             step_action = ensemble_buffer.get_action()
+            # 这个是 config.deploy.num_inference_steps 这么多次循环完成后
+            # 根据 ensemble_buffer 存的一串动作加权平均得到的
             
             if step_action is None:   # no action in the buffer => no movement.
                 continue
             
-            agent.action(step_action, rotation_rep = "rotation_6d")
+            # agent.action(step_action, rotation_rep = "rotation_6d")
+            print(f"execute {step_action}")
+            input("enter")
     
     agent.stop()
 

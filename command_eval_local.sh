@@ -1,1 +1,1 @@
-python eval.py --type local --ckpt logs/collect_toys/policy_last.ckpt --calib calib/1738122909049.npy --config configs/dual_teleop_dino.yaml 
+python eval.py --type local --ckpt /data/haoxiang/logs/rise2_2601/policy_last.ckpt --calib /data/haoxiang/realdata_rise2_ready/calib/1765003071096.npy --config configs/single_rise1.yaml 

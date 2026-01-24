@@ -52,7 +52,7 @@ def vis_data(
     pcd.colors = o3d.utility.Vector3dVector(colors)
     contents.append(pcd)
     # red box stands for the workspace range
-    if workspace_max is not None and workspace_max is not None:
+    if workspace_min is not None and workspace_max is not None:
         bbox3d_1 = o3d.geometry.AxisAlignedBoundingBox(workspace_min, workspace_max)
         bbox3d_1.color = [1, 0, 0]
         contents.append(bbox3d_1)
@@ -70,6 +70,56 @@ def vis_data(
             traj.append(frame)
         contents += traj
     o3d.visualization.draw_geometries(contents)
+
+# def vis_data(
+#         points,
+#         colors,
+#         action_tcps = None,
+#         workspace_min = None,
+#         workspace_max = None,
+#         translation_min = None,
+#         translation_max = None
+#     ):
+#     print(points.min(axis=0), points.max(axis=0))
+    
+#     # 1. 创建主点云
+#     pcd = o3d.geometry.PointCloud()
+#     pcd.points = o3d.utility.Vector3dVector(points)
+#     pcd.colors = o3d.utility.Vector3dVector(colors)
+    
+#     # 我们创建一个合并点云，用来保存到文件
+#     combined_pcd = o3d.geometry.PointCloud()
+#     combined_pcd += pcd
+
+#     # 2. 处理红绿框（把框转成线段点云，方便在文件里看）
+#     def add_box_to_pcd(min_pt, max_pt, color):
+#         bbox = o3d.geometry.AxisAlignedBoundingBox(min_pt, max_pt)
+#         # 将方框的 8 个顶点转成点云（这样你下载 PLY 后能看到方框轮廓）
+#         box_points = np.asarray(bbox.get_box_points())
+#         box_pcd = o3d.geometry.PointCloud()
+#         box_pcd.points = o3d.utility.Vector3dVector(box_points)
+#         box_pcd.paint_uniform_color(color)
+#         return box_pcd
+
+#     if workspace_min is not None and workspace_max is not None:
+#         combined_pcd += add_box_to_pcd(workspace_min, workspace_max, [1, 0, 0]) # 红色
+
+#     if translation_min is not None and translation_max is not None:
+#         combined_pcd += add_box_to_pcd(translation_min, translation_max, [0, 1, 0]) # 绿色
+
+#     # 3. 处理动作轨迹
+#     if action_tcps is not None:
+#         # 这里把预测的动作点直接变成亮黄色的点，存进点云里
+#         action_pts = action_tcps[:, :3]
+#         act_pcd = o3d.geometry.PointCloud()
+#         act_pcd.points = o3d.utility.Vector3dVector(action_pts)
+#         act_pcd.paint_uniform_color([1, 1, 0]) # 黄色动作点
+#         combined_pcd += act_pcd
+
+#     # 4. 【保存文件】 
+#     # 只保存合并后的 PointCloud 对象
+#     o3d.io.write_point_cloud("vis_debug.ply", combined_pcd)
+#     print("--- 离线调试文件 vis_debug.ply 已保存 ---")
 
 
 class TrajLoader:

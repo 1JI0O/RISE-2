@@ -168,3 +168,5 @@ cython_debug/
 #.idea/
 
 weights/
+saved_test_data/color_0000.png
+saved_test_data/depth_0000.png
