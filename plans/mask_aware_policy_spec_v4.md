@@ -2,7 +2,7 @@
 
 > 文档目标：在不改动现有 `.py` 代码的前提下，给出可直接落地的实现规范，并对旧文档中的过强约束做降级或移除。
 >
-> 关联旧文档：[`plans/mask_aware_policy_plan.md`](plans/mask_aware_policy_plan.md)、[`plans/mask_aware_policy_plan_v2_2dmask_to_3dfilter.md`](plans/mask_aware_policy_plan_v2_2dmask_to_3dfilter.md)、[`plans/mask_aware_policy_spec_v3.md`](plans/mask_aware_policy_spec_v3.md)。
+> 关联旧文档：[`plans/mask_aware_policy_plan.md`](mask_aware_policy_plan.md)、[`plans/mask_aware_policy_plan_v2_2dmask_to_3dfilter.md`](mask_aware_policy_plan_v2_2dmask_to_3dfilter.md)、[`plans/mask_aware_policy_spec_v3.md`](mask_aware_policy_spec_v3.md)。
 
 ---
 
@@ -23,72 +23,72 @@
 
 ### 1.1 来自 v1 计划文档的修订
 
-来源：[`plans/mask_aware_policy_plan.md`](plans/mask_aware_policy_plan.md)
+来源：[`plans/mask_aware_policy_plan.md`](mask_aware_policy_plan.md)
 
-1. [`§5.2 全 1 mask sanity`](plans/mask_aware_policy_plan.md:180)
+1. [`§5.2 全 1 mask sanity`](mask_aware_policy_plan.md:180)
    - 原倾向：接近必测。
    - v4 调整：降级到 P2。
    - 理由：真实数据中几乎不出现整帧全白 mask，但实现仍需有数值兜底。
 
-2. [`§5.3 可视化辅助 强烈建议`](plans/mask_aware_policy_plan.md:187)
+2. [`§5.3 可视化辅助 强烈建议`](mask_aware_policy_plan.md:187)
    - 原倾向：接近上线前必须做。
    - v4 调整：定位为 SHOULD，归入 P1。
    - 理由：有助定位问题，但不应阻塞主功能交付。
 
-3. [`§7 步骤8 全 0/全 1 极端 case`](plans/mask_aware_policy_plan.md:212)
+3. [`§7 步骤8 全 0/全 1 极端 case`](mask_aware_policy_plan.md:212)
    - 原倾向：最小验证必做。
    - v4 调整：全 0 保留为 P1，全 1 降级 P2。
    - 理由：全 1 属于异常边界，重点改为“运行稳定且有告警”。
 
 ### 1.2 来自 v2 计划文档的修订
 
-来源：[`plans/mask_aware_policy_plan_v2_2dmask_to_3dfilter.md`](plans/mask_aware_policy_plan_v2_2dmask_to_3dfilter.md)
+来源：[`plans/mask_aware_policy_plan_v2_2dmask_to_3dfilter.md`](mask_aware_policy_plan_v2_2dmask_to_3dfilter.md)
 
-1. [`§2.2 必须改成自定义 back projection 并保留 uv`](plans/mask_aware_policy_plan_v2_2dmask_to_3dfilter.md:67)
+1. [`§2.2 必须改成自定义 back projection 并保留 uv`](mask_aware_policy_plan_v2_2dmask_to_3dfilter.md:67)
    - 原约束：MUST。
    - v4 调整：降为 MAY。
    - 理由：先对深度按 mask 置零再走现有点云流程，也能实现像素级精确删点，侵入更小。
 
-2. [`§2.3.1 voxel 聚合传播策略必须写死`](plans/mask_aware_policy_plan_v2_2dmask_to_3dfilter.md:119)
+2. [`§2.3.1 voxel 聚合传播策略必须写死`](mask_aware_policy_plan_v2_2dmask_to_3dfilter.md:119)
    - 原约束：MUST。
    - v4 调整：仅在 soft keep 路线下为 SHOULD，其余场景 MAY。
    - 理由：hard delete 主路径不依赖 voxel 级 mask 聚合语义。
 
-3. [`§6.2 mask 全 0 严格退化原始 pipeline`](plans/mask_aware_policy_plan_v2_2dmask_to_3dfilter.md:253)
+3. [`§6.2 mask 全 0 严格退化原始 pipeline`](mask_aware_policy_plan_v2_2dmask_to_3dfilter.md:253)
    - 原约束：接近严格一致。
    - v4 调整：降为 P1 近似一致。
    - 理由：浮点与采样细节下严格逐值一致不现实，要求行为一致更合理。
 
-4. [`§6.2 mask 全 1 专项检查`](plans/mask_aware_policy_plan_v2_2dmask_to_3dfilter.md:254)
+4. [`§6.2 mask 全 1 专项检查`](mask_aware_policy_plan_v2_2dmask_to_3dfilter.md:254)
    - 原约束：必测。
    - v4 调整：降级到 P2。
    - 理由：低概率异常场景，保留为可选健壮性验证。
 
 ### 1.3 来自 v3 规范文档的修订
 
-来源：[`plans/mask_aware_policy_spec_v3.md`](plans/mask_aware_policy_spec_v3.md)
+来源：[`plans/mask_aware_policy_spec_v3.md`](mask_aware_policy_spec_v3.md)
 
-1. [`§1 阈值必须 >0 且禁止其他阈值`](plans/mask_aware_policy_spec_v3.md:36)
+1. [`§1 阈值必须 >0 且禁止其他阈值`](mask_aware_policy_spec_v3.md:36)
    - 原约束：过强。
    - v4 调整：默认阈值为 `>0`，但阈值 SHOULD 可配置。
    - 理由：不同 mask 生成链路可能存在灰度噪声。
 
-2. [`§4 A B 两路径都必须支持且默认都开`](plans/mask_aware_policy_spec_v3.md:117)
+2. [`§4 A B 两路径都必须支持且默认都开`](mask_aware_policy_spec_v3.md:117)
    - 原约束：过强。
    - v4 调整：2D 降权路径 MUST；3D 过滤路径 SHOULD，并保持独立开关。
    - 理由：先保证最小可用，再逐步开启 3D 过滤更稳妥。
 
-3. [`§8 检查3 同帧启停后点数必须显著减少`](plans/mask_aware_policy_spec_v3.md:250)
+3. [`§8 检查3 同帧启停后点数必须显著减少`](mask_aware_policy_spec_v3.md:250)
    - 原约束：MUST。
    - v4 调整：降为 P2。
    - 理由：依赖数据分布和场景，不能作为硬门槛。
 
-4. [`§8 检查4 全白 mask 下 NaN Inf 且 R1 R2 专项`](plans/mask_aware_policy_spec_v3.md:251)
+4. [`§8 检查4 全白 mask 下 NaN Inf 且 R1 R2 专项`](mask_aware_policy_spec_v3.md:251)
    - 原约束：MUST。
    - v4 调整：降为 P2；默认仅采用 `r_min` 方案，不把 R1 R2 设为默认。
    - 理由：你已确认该项必要性低，且 v3 已将默认稳定策略转为 `r_min`。
 
-5. [`§2.2 对齐日志必须打印首尾映射`](plans/mask_aware_policy_spec_v3.md:73)
+5. [`§2.2 对齐日志必须打印首尾映射`](mask_aware_policy_spec_v3.md:73)
    - 原约束：MUST。
    - v4 调整：SHOULD。
    - 理由：保留可观测性，但不作为阻塞条件。
@@ -218,25 +218,25 @@
 以下为文档级挂接点，不涉及本次代码改动：
 
 1. Dataset 读取与输出
-   - [`RealWorldDataset.__getitem__()`](dataset/realworld.py:229)
-   - [`RealWorldDataset.load_point_cloud()`](dataset/realworld.py:197)
-   - [`collate_fn()`](dataset/realworld.py:340)
+   - [`RealWorldDataset.__getitem__()`](../dataset/realworld.py:229)
+   - [`RealWorldDataset.load_point_cloud()`](../dataset/realworld.py:197)
+   - [`collate_fn()`](../dataset/realworld.py:340)
 
 2. 图像与坐标预处理
-   - [`ImageProcessor.preprocess_images()`](dataset/data_utils.py:271)
-   - [`ImageProcessor.get_image_coordinates()`](dataset/data_utils.py:243)
+   - [`ImageProcessor.preprocess_images()`](../dataset/data_utils.py:271)
+   - [`ImageProcessor.get_image_coordinates()`](../dataset/data_utils.py:243)
 
 3. Policy 传参与融合
-   - [`RISE2.forward()`](policy/policy.py:52)
-   - [`SpatialAligner.forward()`](policy/sparse_modules.py:184)
-   - [`WeightedSpatialInterpolation.forward()`](policy/sparse_modules.py:72)
+   - [`RISE2.forward()`](../policy/policy.py:52)
+   - [`SpatialAligner.forward()`](../policy/sparse_modules.py:184)
+   - [`WeightedSpatialInterpolation.forward()`](../policy/sparse_modules.py:72)
 
 4. 训练调用链
-   - [`train.train()`](train.py:29)
+   - [`train.train()`](../train.py:29)
 
 5. 配置入口
-   - [`configs/test.yaml`](configs/test.yaml)
-   - [`configs/single_rise1.yaml`](configs/single_rise1.yaml)
+   - [`configs/test.yaml`](../configs/test.yaml)
+   - [`configs/single_rise1.yaml`](../configs/single_rise1.yaml)
 
 ---
 
