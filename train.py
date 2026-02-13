@@ -152,8 +152,12 @@ def train(args_override):
             image = data["image_feats"].to(device)
             image_coords = data["image_coords"].to(device)
             cloud_data = ME.SparseTensor(cloud_feats, cloud_coords)
+            # 可选读取 2D patch 可信度并传给 policy
+            image_mask_weight = data.get("image_mask_weight", None)
+            if image_mask_weight is not None:
+                image_mask_weight = image_mask_weight.to(device)
             # forward
-            loss = policy(cloud_data, image, image_coords, actions = action_data)
+            loss = policy(cloud_data, image, image_coords, image_mask_weight = image_mask_weight, actions = action_data)
             # backward
             loss.backward()
             optimizer.step()

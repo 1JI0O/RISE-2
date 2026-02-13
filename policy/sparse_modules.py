@@ -70,7 +70,7 @@ class WeightedSpatialInterpolation(nn.Module):
         self.interp_fn_mode = interp_fn_mode
 
     def forward(
-        self, tgt, src, tgt_feats, src_feats, k=3
+        self, tgt, src, tgt_feats, src_feats, src_weights = None, k=3, r_min = 1e-3, eps = 1e-6, tiny = 1e-6
     ) -> torch.Tensor:
         """
         Args:
@@ -78,6 +78,11 @@ class WeightedSpatialInterpolation(nn.Module):
             src: (B, m, 3) tensor of the xyz positions of the source features
             tgt_feats: (B, C1, n) tensor of the target features
             src_feats: (B, C2, m) tensor of the source features
+
+            src_weights: (B, m) tensor of patch reliability weights
+            r_min: floor of reliability for numerical stability
+            eps: distance epsilon
+            tiny: normalization epsilon
 
         Returns:
             interp_features : (B, mlp[-1], n) tensor of the features of the interpolated features
@@ -95,9 +100,16 @@ class WeightedSpatialInterpolation(nn.Module):
                 selected_idxs = all_idxs[:, :k] # (n, k)
                 selected_feats = CustomWeightedInterpFn.apply(src_feats[i], selected_idxs) # (n, C2, k)
 
-            weight = 1.0 / (all_dists[:, :k] + 1e-6)
+            dist_weight = 1.0 / (all_dists[:, :k] + eps)
+            if src_weights is not None:
+                # 对 kNN patch 的可信度做 gather 并做下限保护
+                selected_w = src_weights[i][selected_idxs]
+                selected_w = torch.clamp(selected_w, min = r_min, max = 1.0)
+                weight = dist_weight * selected_w
+            else:
+                weight = dist_weight
             norm = torch.sum(weight, dim=1, keepdim=True)
-            weight = weight / norm
+            weight = weight / (norm + tiny)
             selected_feats = (selected_feats * weight.unsqueeze(1)).sum(dim=2) # (n, C2)
             interpolated_feats.append(selected_feats)
 
@@ -181,7 +193,7 @@ class SpatialAligner(nn.Module):
         self.conv = ResNet14Max(in_channels=mlps[-1], out_channels=out_channels, conv1_kernel_size=3, strides=(4,2,2,2), dilations=(4,1,1,1), bn_momentum=0.02, init_pool=None)
         self.position_embedding = SparsePositionalEncoding(out_channels)
 
-    def forward(self, sinput, image_feat, image_coord, max_num_token=150):
+    def forward(self, sinput, image_feat, image_coord, image_mask_weight = None, max_num_token=150):
         ''' max_num_token: maximum token number for each point cloud, which can be adjusted depending on the scene density.
                            150 for voxel_size=0.005 in our experiments
         '''
@@ -195,7 +207,15 @@ class SpatialAligner(nn.Module):
             cloud_feat_i = cloud_feat[cloud_mask_i].permute(1, 0).unsqueeze(0)
             image_coord_i = image_coord[i:i+1]
             image_feat_i = image_feat[i].permute(1, 0).unsqueeze(0)
-            cloud_feat_i = self.interp(cloud_coord_i.float(), image_coord_i.float(), cloud_feat_i, image_feat_i)
+            # 每个样本独立传递 2D patch 可信度
+            mask_weight_i = None if image_mask_weight is None else image_mask_weight[i:i+1]
+            cloud_feat_i = self.interp(
+                cloud_coord_i.float(),
+                image_coord_i.float(),
+                cloud_feat_i,
+                image_feat_i,
+                src_weights = mask_weight_i,
+            )
             cloud_feat_list.append(cloud_feat_i)
         cloud_feat = torch.cat(cloud_feat_list, dim=2)
         cloud_feat = self.interp_proj(cloud_feat)

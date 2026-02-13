@@ -78,6 +78,21 @@ deploy:
   vis: true
 
 
+mask_aware:
+  enabled: false
+  mask_root: null
+  align_mode: sorted_index
+  enable_2d_reweight: true
+  enable_3d_filter: true
+  mask_threshold: 0
+  mask_white_is_untrusted: true
+  r_min: 0.001
+  interp_eps: 0.000001
+  interp_tiny: 0.000001
+  empty_cloud_policy: warn_and_skip
+  log_alignment_preview: true
+
+
 model:
   image_enc: dinov2-base
   cloud_enc_dim: 128

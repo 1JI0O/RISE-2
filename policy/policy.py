@@ -49,7 +49,7 @@ class RISE2(nn.Module):
 
         return attn_mask
 
-    def forward(self, cloud, image, image_coord, actions = None):
+    def forward(self, cloud, image, image_coord, image_mask_weight = None, actions = None):
         with autocast(
             device_type = image.device.type, 
             dtype = self.image_enc_dtype if image.device.type == 'cuda' else torch.float32
@@ -70,7 +70,11 @@ class RISE2(nn.Module):
 
         cloud_feat = self.sparse_encoder(cloud)
 
-        src, pos, src_padding_mask = self.spatial_aligner(cloud_feat, image_feat, image_coord)
+        # 将 patch 可信度展平成与 image token 对齐的一维序列
+        if image_mask_weight is not None:
+            image_mask_weight = image_mask_weight.flatten(2).squeeze(1)
+
+        src, pos, src_padding_mask = self.spatial_aligner(cloud_feat, image_feat, image_coord, image_mask_weight = image_mask_weight)
 
         batch_size, src_len = src.size(0), src.size(1)
 
