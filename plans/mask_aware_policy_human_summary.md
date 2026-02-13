@@ -253,21 +253,21 @@ forward(self, cloud, image, image_coord, image_mask_weight=None, actions=None)
 
 1. 距离项：
 
-\[
+$$
 \text{dist\_weight}_j = \frac{1}{d_j + \text{eps}}
-\]
+$$
 
 2. 可靠度项：
 
-\[
+$$
 \text{rel}_j = \text{clamp}(r_j, r_{min}, 1.0)
-\]
+$$
 
 3. 合并并归一化：
 
-\[
+$$
 w_j = \frac{\text{dist\_weight}_j \cdot \text{rel}_j}{\sum_t (\text{dist\_weight}_t \cdot \text{rel}_t) + \text{tiny}}
-\]
+$$
 
 这意味着：
 

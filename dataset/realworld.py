@@ -453,7 +453,8 @@ class RealWorldDataset(Dataset):
         depths_for_cloud = depths
         if self.mask_aware_enabled and self.mask_enable_3d_filter and mask01 is not None:
             depths_for_cloud = depths.copy()
-            depths_for_cloud[mask01 > 0.5] = 0.0
+            depths_for_cloud[mask01 > 0.5] = 0.0 
+            # 用>0.5判断，避免浮点等号比较
 
         # point cloud
         intrinsics, depth_scale = projector.intrinsics[cam_id], projector.depth_scales[cam_id]
