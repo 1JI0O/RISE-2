@@ -42,6 +42,162 @@ default_args = edict({
     "port": 8000
 })
 
+
+def _build_mask_aware_cfg(config):
+    # 统一推理期 mask-aware 配置并补齐默认值
+    default_cfg = {
+        "enabled": False,
+        "enable_3d_filter": True,
+        "enable_2d_reweight": True,
+        "mask_threshold": 0,
+        "mask_white_is_untrusted": True,
+        "r_min": 1e-3,
+        "interp_eps": 1e-6,
+        "interp_tiny": 1e-6,
+        "infer_allow_none": True,
+        "infer_none_policy": "no_mask_fallback",
+        "empty_cloud_policy": "warn_and_skip_filter",
+    }
+    raw_cfg = getattr(config, "mask_aware", {})
+    raw_cfg = dict(raw_cfg) if raw_cfg is not None else {}
+
+    merged_cfg = deepcopy(default_cfg)
+    for key in default_cfg:
+        if key in raw_cfg and raw_cfg[key] is not None:
+            merged_cfg[key] = raw_cfg[key]
+
+    valid_none_policy = {"no_mask_fallback", "fail_fast"}
+    valid_empty_cloud_policy = {"warn_and_skip_filter", "fail_fast"}
+
+    try:
+        merged_cfg["enabled"] = bool(merged_cfg["enabled"])
+        merged_cfg["enable_3d_filter"] = bool(merged_cfg["enable_3d_filter"])
+        merged_cfg["enable_2d_reweight"] = bool(merged_cfg["enable_2d_reweight"])
+        merged_cfg["mask_threshold"] = float(merged_cfg["mask_threshold"])
+        merged_cfg["mask_white_is_untrusted"] = bool(merged_cfg["mask_white_is_untrusted"])
+        merged_cfg["r_min"] = float(merged_cfg["r_min"])
+        merged_cfg["interp_eps"] = float(merged_cfg["interp_eps"])
+        merged_cfg["interp_tiny"] = float(merged_cfg["interp_tiny"])
+        merged_cfg["infer_allow_none"] = bool(merged_cfg["infer_allow_none"])
+        merged_cfg["infer_none_policy"] = str(merged_cfg["infer_none_policy"])
+        merged_cfg["empty_cloud_policy"] = str(merged_cfg["empty_cloud_policy"])
+    except Exception as exc:
+        print(f"[mask-aware] invalid config, fallback to disabled: {exc}")
+        merged_cfg = deepcopy(default_cfg)
+
+    if merged_cfg["infer_none_policy"] not in valid_none_policy:
+        print("[mask-aware] invalid infer_none_policy, use no_mask_fallback")
+        merged_cfg["infer_none_policy"] = "no_mask_fallback"
+
+    if merged_cfg["empty_cloud_policy"] not in valid_empty_cloud_policy:
+        print("[mask-aware] invalid empty_cloud_policy, use warn_and_skip_filter")
+        merged_cfg["empty_cloud_policy"] = "warn_and_skip_filter"
+
+    return edict(merged_cfg)
+
+
+def _log_mask_aware_summary(mask_cfg):
+    # 启动时打印一次配置摘要用于排查
+    print(
+        "[mask-aware] enabled={} 3d_filter={} 2d_reweight={} threshold={} "
+        "none_policy={} empty_cloud_policy={}".format(
+            mask_cfg.enabled,
+            mask_cfg.enable_3d_filter,
+            mask_cfg.enable_2d_reweight,
+            mask_cfg.mask_threshold,
+            mask_cfg.infer_none_policy,
+            mask_cfg.empty_cloud_policy,
+        )
+    )
+
+
+def _log_mask_fallback(step, reason, action):
+    # 异常回退统一日志输出
+    print(f"[mask-aware] step={step} reason={reason} action={action}")
+
+
+def infer_mask(color, depth, proprio, meta):
+    # 预留推理期 mask 接口占位
+    return None
+
+
+def _to_numpy_mask(mask):
+    # 将输入 mask 统一转换为 numpy
+    if isinstance(mask, torch.Tensor):
+        return mask.detach().cpu().numpy()
+    return np.asarray(mask)
+
+
+def _normalize_mask01(mask, depth_shape, mask_cfg):
+    # 将 mask 规范到 depth 尺寸并转换为 float32 的 0/1
+    mask_np = _to_numpy_mask(mask)
+
+    if mask_np.ndim == 3:
+        if mask_np.shape[0] == 1:
+            mask_np = mask_np[0]
+        elif mask_np.shape[-1] == 1:
+            mask_np = mask_np[..., 0]
+        else:
+            raise ValueError(f"unsupported mask shape: {mask_np.shape}")
+    elif mask_np.ndim != 2:
+        raise ValueError(f"unsupported mask shape: {mask_np.shape}")
+
+    target_h, target_w = int(depth_shape[0]), int(depth_shape[1])
+    if mask_np.shape[0] != target_h or mask_np.shape[1] != target_w:
+        print(
+            "[mask-aware] mask size mismatch, resize with nearest: "
+            f"mask={mask_np.shape}, depth=({target_h}, {target_w})"
+        )
+        mask_np = cv2.resize(
+            mask_np.astype(np.float32),
+            (target_w, target_h),
+            interpolation = cv2.INTER_NEAREST,
+        )
+
+    threshold = float(mask_cfg.mask_threshold)
+    if bool(mask_cfg.mask_white_is_untrusted):
+        mask01 = (mask_np > threshold).astype(np.float32)
+    else:
+        mask01 = (mask_np <= threshold).astype(np.float32)
+
+    return mask01
+
+
+def _safe_infer_mask(color, depth, proprio, meta, mask_cfg):
+    # 执行 infer_mask 并把异常统一转换为回退信号
+    try:
+        raw_mask = infer_mask(color, depth, proprio, meta)
+    except Exception:
+        return None, "infer_exception"
+
+    if raw_mask is None:
+        return None, "infer_none"
+
+    try:
+        mask01 = _normalize_mask01(raw_mask, depth.shape[:2], mask_cfg)
+    except Exception:
+        return None, "mask_invalid"
+
+    return mask01, None
+
+
+def _build_image_mask_weight(mask01, image_processor):
+    # 根据二维 mask 构建图像 patch 级可信度权重
+    try:
+        mask_tensor = torch.from_numpy(mask01[np.newaxis].astype(np.float32))
+        mask_tensor = resize_image(
+            mask_tensor,
+            image_processor.img_size,
+            interpolation = T.InterpolationMode.NEAREST,
+        )
+        mask_ratio = image_processor.image_coord_pooling(mask_tensor)
+        image_mask_weight = (1.0 - mask_ratio).clamp(0.0, 1.0).to(torch.float32)
+    except Exception:
+        return None
+
+    return image_mask_weight
+
+
 def load_test_obs(color_path, depth_path):
     # 1. 加载彩色图并转为 RGB (OpenCV 默认读入是 BGR)
     color_image = cv2.imread(color_path)
@@ -164,6 +320,7 @@ def evaluate(args_override):
         config = edict(yaml.load(f, Loader = yaml.FullLoader))
     config.data.normalization.trans_min = np.asarray(config.data.normalization.trans_min)
     config.data.normalization.trans_max = np.asarray(config.data.normalization.trans_max)
+    config.mask_aware = _build_mask_aware_cfg(config)
 
     # set seed
     set_seed(config.deploy.seed)
@@ -239,6 +396,20 @@ def evaluate(args_override):
     # ensemble buffer
     ensemble_buffer = EnsembleBuffer(mode = config.deploy.ensemble_mode)
 
+    # 输出 mask-aware 配置摘要
+    _log_mask_aware_summary(config.mask_aware)
+
+    # 记录异常回退统计
+    mask_stats = {
+        "infer_none": 0,
+        "infer_exception": 0,
+        "mask_invalid": 0,
+        "empty_cloud_skip": 0,
+        "reweight_fallback": 0,
+        "points_nonfinite": 0,
+        "weight_nonfinite": 0,
+    }
+
     # evaluation rollout
     print("Ready for rollout. Press Enter to continue...")
     input()
@@ -247,25 +418,98 @@ def evaluate(args_override):
         for t in range(config.deploy.max_steps):
             if t % config.deploy.num_inference_steps == 0:
                 # pre-process inputs
-                # colors, depths = agent.get_global_observation()
+                colors, depths = agent.get_global_observation()
 
-                colors, depths = load_test_obs(test_color, test_depth)
+                # colors, depths = load_test_obs(test_color, test_depth)
+
+                # 本地推理启用 mask-aware 分支
+                mask_enabled = bool(config.mask_aware.enabled and args.type == "local")
+                mask01, mask_reason = None, None
+                if mask_enabled:
+                    mask01, mask_reason = _safe_infer_mask(
+                        color = colors,
+                        depth = depths,
+                        proprio = None,
+                        meta = {"step": t, "mode": args.type},
+                        mask_cfg = config.mask_aware,
+                    )
+                    if mask01 is None:
+                        reason = mask_reason or "unknown_infer_failure"
+                        if reason in mask_stats:
+                            mask_stats[reason] += 1
+                        if config.mask_aware.infer_none_policy == "fail_fast":
+                            _log_mask_fallback(t, reason, "fail_fast")
+                            raise RuntimeError(f"mask unavailable with fail_fast, reason={reason}")
+                        _log_mask_fallback(t, reason, "no_mask_fallback")
+
+                # 根据 mask 生成点云深度输入
+                depths_for_cloud = depths
+                if mask_enabled and config.mask_aware.enable_3d_filter and mask01 is not None:
+                    depths_for_cloud = depths.copy()
+                    depths_for_cloud[mask01 > 0.5] = 0
+
                 # create cloud inputs
-                coords, points, cloud = create_input(
-                    colors,
-                    depths,
+                create_input_kwargs = dict(
                     # cam_intrinsics = agent.intrinsics,
                     cam_intrinsics = fake_intrinsics,
                     config = config,
                     # depth_scale = agent.camera.depth_scale,
                     depth_scale = fake_depth_scale,
-                    rescale_factor = 1.0
+                    rescale_factor = 1.0,
+                )
+                coords, points, cloud = create_input(
+                    colors,
+                    depths_for_cloud,
+                    **create_input_kwargs,
                 )
 
+                # 点云出现非法数值时优先回退到原始深度重建
+                if points.size > 0 and (not np.isfinite(points).all()):
+                    if config.mask_aware.empty_cloud_policy == "fail_fast":
+                        _log_mask_fallback(t, "points_nonfinite", "fail_fast")
+                        raise RuntimeError("non-finite points after cloud build")
+                    mask_stats["points_nonfinite"] += 1
+                    _log_mask_fallback(t, "points_nonfinite", "rebuild_from_original_depth")
+                    coords, points, cloud = create_input(
+                        colors,
+                        depths,
+                        **create_input_kwargs,
+                    )
+
+                # 过滤后空点云回退
+                if (
+                    mask_enabled
+                    and config.mask_aware.enable_3d_filter
+                    and mask01 is not None
+                    and points.shape[0] == 0
+                ):
+                    if config.mask_aware.empty_cloud_policy == "fail_fast":
+                        _log_mask_fallback(t, "empty_cloud_after_3d_filter", "fail_fast")
+                        raise RuntimeError("empty cloud after 3d filter")
+                    mask_stats["empty_cloud_skip"] += 1
+                    _log_mask_fallback(t, "empty_cloud_after_3d_filter", "skip_filter_rebuild")
+                    coords, points, cloud = create_input(
+                        colors,
+                        depths,
+                        **create_input_kwargs,
+                    )
+
                 # create image inputs
-                # image_coords = image_processor.get_image_coordinates(depths, agent.intrinsics, agent.camera.depth_scale)     
-                image_coords = image_processor.get_image_coordinates(depths, fake_intrinsics, fake_depth_scale)   
+                # image_coords = image_processor.get_image_coordinates(depths, agent.intrinsics, agent.camera.depth_scale)
+                image_coords = image_processor.get_image_coordinates(depths, fake_intrinsics, fake_depth_scale)
                 colors, image_coords = image_processor.preprocess_images(colors, image_coords)
+
+                # 根据 mask 构建 patch 级可信度权重
+                image_mask_weight = None
+                if mask_enabled and config.mask_aware.enable_2d_reweight and mask01 is not None:
+                    image_mask_weight = _build_image_mask_weight(mask01, image_processor)
+                    if image_mask_weight is None:
+                        mask_stats["reweight_fallback"] += 1
+                        _log_mask_fallback(t, "reweight_build_failed", "disable_2d_reweight")
+                    elif not torch.isfinite(image_mask_weight).all():
+                        mask_stats["weight_nonfinite"] += 1
+                        _log_mask_fallback(t, "reweight_nonfinite", "disable_2d_reweight")
+                        image_mask_weight = None
 
                 # predict action
                 if args.type == "local":
@@ -276,12 +520,15 @@ def evaluate(args_override):
 
                     colors = colors.unsqueeze(0).to(device)
                     image_coords = image_coords.unsqueeze(0).to(device)
+                    if image_mask_weight is not None:
+                        image_mask_weight = image_mask_weight.unsqueeze(0).to(device)
 
                     # predict
                     pred_raw_action = policy(
-                        cloud_data, 
-                        colors, 
+                        cloud_data,
+                        colors,
                         image_coords,
+                        image_mask_weight = image_mask_weight,
                         actions = None,
                     ).squeeze(0).cpu().numpy()
 
@@ -332,7 +579,20 @@ def evaluate(args_override):
             # agent.action(step_action, rotation_rep = "rotation_6d")
             print(f"execute {step_action}")
             input("enter")
-    
+
+    print(
+        "[mask-aware] summary infer_none={} infer_exception={} mask_invalid={} "
+        "empty_cloud_skip={} reweight_fallback={} points_nonfinite={} weight_nonfinite={}".format(
+            mask_stats["infer_none"],
+            mask_stats["infer_exception"],
+            mask_stats["mask_invalid"],
+            mask_stats["empty_cloud_skip"],
+            mask_stats["reweight_fallback"],
+            mask_stats["points_nonfinite"],
+            mask_stats["weight_nonfinite"],
+        )
+    )
+
     agent.stop()
 
 
