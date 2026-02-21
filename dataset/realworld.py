@@ -448,6 +448,14 @@ class RealWorldDataset(Dataset):
             mask01_t = resize_image(mask01_t, self.img_size, interpolation = T.InterpolationMode.NEAREST)
             mask_ratio = self.image_processor.image_coord_pooling(mask01_t)
             image_mask_weight = 1.0 - mask_ratio
+
+            # 训练路径尾部携带插值稳定参数，便于下游在不改接口的情况下接线
+            flat_weight = image_mask_weight.reshape(1, -1)
+            interp_stable_tail = torch.tensor(
+                [[self.mask_r_min, self.mask_interp_eps, self.mask_interp_tiny]],
+                dtype = flat_weight.dtype
+            )
+            image_mask_weight = torch.cat([flat_weight, interp_stable_tail], dim = 1)
         
         # 在深度图阶段应用 mask 做精确 3D 过滤
         depths_for_cloud = depths

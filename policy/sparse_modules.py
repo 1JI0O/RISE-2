@@ -207,14 +207,30 @@ class SpatialAligner(nn.Module):
             cloud_feat_i = cloud_feat[cloud_mask_i].permute(1, 0).unsqueeze(0)
             image_coord_i = image_coord[i:i+1]
             image_feat_i = image_feat[i].permute(1, 0).unsqueeze(0)
-            # 每个样本独立传递 2D patch 可信度
+            # 每个样本独立传递 2D patch 可信度（兼容尾部携带稳定参数）
             mask_weight_i = None if image_mask_weight is None else image_mask_weight[i:i+1]
+            interp_r_min, interp_eps, interp_tiny = 1e-3, 1e-6, 1e-6
+            if mask_weight_i is not None:
+                src_len = image_coord_i.size(1)
+                weight_len = mask_weight_i.size(1)
+                if weight_len == src_len + 3:
+                    interp_r_min = float(mask_weight_i[0, -3].item())
+                    interp_eps = float(mask_weight_i[0, -2].item())
+                    interp_tiny = float(mask_weight_i[0, -1].item())
+                    mask_weight_i = mask_weight_i[:, :src_len]
+                elif weight_len != src_len:
+                    raise ValueError(
+                        f"image_mask_weight length mismatch: got {weight_len}, expected {src_len} or {src_len + 3}"
+                    )
             cloud_feat_i = self.interp(
                 cloud_coord_i.float(),
                 image_coord_i.float(),
                 cloud_feat_i,
                 image_feat_i,
                 src_weights = mask_weight_i,
+                r_min = interp_r_min,
+                eps = interp_eps,
+                tiny = interp_tiny,
             )
             cloud_feat_list.append(cloud_feat_i)
         cloud_feat = torch.cat(cloud_feat_list, dim=2)
