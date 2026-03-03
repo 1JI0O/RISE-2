@@ -1,3 +1,4 @@
+import os
 import yaml
 import torch
 import argparse
@@ -116,9 +117,43 @@ def _log_mask_fallback(step, reason, action):
     print(f"[mask-aware] step={step} reason={reason} action={action}")
 
 
-def infer_mask(color, depth, proprio, meta):
-    # 预留推理期 mask 接口占位
+# ── 模块级 renderer 引用，由 evaluate() 在启动时初始化 ──
+_arm_renderer = None
+
+
+def get_arm_joints(meta=None):
+    """
+    预留接口：返回当前机械臂关节角。
+
+    Returns
+    -------
+    (left_joint, right_joint) : tuple of np.ndarray, shape (num_robot_joints+1,)
+        前 num_robot_joints 个元素为关节角（弧度），最后一个元素为夹爪宽度（米）。
+    None
+        无法获取时返回 None，上层会触发 no_mask_fallback。
+
+    实际部署时在此对接机械臂 SDK（例如读取 Flexiv 的 joint_pos + gripper_width）。
+    """
     return None
+
+
+def infer_mask(color, depth, proprio, meta):
+    """
+    通过 URDF 渲染当前机械臂姿态，返回像素级 mask。
+
+    Returns
+    -------
+    mask : np.ndarray (H, W) uint8  —— 255 = 机械臂像素，0 = 背景
+    None  —— renderer 未初始化或关节角不可用时
+    """
+    if _arm_renderer is None:
+        return None
+    joints = get_arm_joints(meta)
+    if joints is None:
+        return None
+    left_joint, right_joint = joints
+    _arm_renderer.update_joints(left_joint, right_joint)
+    return _arm_renderer.render_mask()
 
 
 def _to_numpy_mask(mask):
@@ -398,6 +433,33 @@ def evaluate(args_override):
 
     # 输出 mask-aware 配置摘要
     _log_mask_aware_summary(config.mask_aware)
+
+    # 初始化 URDF renderer（仅本地 mask-aware 模式）
+    global _arm_renderer
+    _arm_renderer = None
+    if config.mask_aware.enabled and args.type == "local":
+        try:
+            from mask.renderer import SeparateRiseRobotRenderer
+            _urdf_left  = getattr(config.mask_aware, "urdf_left",
+                                  os.path.join("airexo", "airexo", "urdf_models", "robot", "left_robot.urdf"))
+            _urdf_right = getattr(config.mask_aware, "urdf_right",
+                                  os.path.join("airexo", "airexo", "urdf_models", "robot", "right_robot.urdf"))
+            # cam_to_left/right_base 由 DualArmProjector 在 calibration 阶段计算
+            _arm_renderer = SeparateRiseRobotRenderer(
+                cam_to_left_base  = projector.cam_to_left_base,
+                cam_to_right_base = projector.cam_to_right_base,
+                intrinsic         = fake_intrinsics,   # 实际部署替换为 agent.intrinsics
+                width             = 1280,
+                height            = 720,
+                num_robot_joints  = 7,
+                urdf_left         = _urdf_left,
+                urdf_right        = _urdf_right,
+            )
+            print("[mask-aware] renderer initialized (left={}, right={})".format(
+                _urdf_left, _urdf_right))
+        except Exception as _e:
+            print(f"[mask-aware] renderer init failed, mask disabled: {_e}")
+            _arm_renderer = None
 
     # 记录异常回退统计
     mask_stats = {
