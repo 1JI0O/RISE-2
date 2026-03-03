@@ -46,6 +46,8 @@ class RealWorldDataset(Dataset):
         self.projectors = {}
         # 缓存每个场景相机的 color 到 mask 映射
         self._mask_lookup_cache = {}
+        # 记录每个场景的标定来源日志，避免重复打印
+        self._calib_source_logged = set()
 
         # create image processor
         self.image_processor = ImageProcessor(
@@ -268,9 +270,19 @@ class RealWorldDataset(Dataset):
 
     def _parse_config(self, config):
         self.robot_type = config.robot_type
-        self.data_type = config.data.type 
-        self.num_action = config.data.num_action 
-        self.vis = config.data.vis 
+        self.data_type = config.data.type
+        self.num_action = config.data.num_action
+        self.vis = config.data.vis
+
+        vis_save_dir = getattr(config.data, "vis_save_dir", None)
+        if vis_save_dir in [None, "", "null", "None"]:
+            self.vis_save_dir = None
+        else:
+            self.vis_save_dir = str(vis_save_dir)
+        self.vis_save_png = bool(getattr(config.data, "vis_save_png", False))
+        self.vis_save_ply = bool(getattr(config.data, "vis_save_ply", False))
+        self.vis_force_offscreen = bool(getattr(config.data, "vis_force_offscreen", True))
+
         self.voxel_size = config.data.voxel_size
         self.translation_min = np.asarray(config.data.normalization.trans_min)
         self.translation_max = np.asarray(config.data.normalization.trans_max)
@@ -301,6 +313,15 @@ class RealWorldDataset(Dataset):
             raise ValueError(f"Unknown image encoder: {image_enc}")
         self.repeat_dataset = config.data.repeat_dataset
 
+        # 可选：任务级统一标定时间戳（优先于 scene/meta.json）
+        calib_timestamp = getattr(config.data, "calib_timestamp", None)
+        if calib_timestamp in [None, "", "null"]:
+            self.config_calib_timestamp = None
+        else:
+            self.config_calib_timestamp = str(calib_timestamp).strip()
+            if self.config_calib_timestamp in ["", "null", "None"]:
+                self.config_calib_timestamp = None
+
         # 统一读取mask-aware配置
         mask_cfg = getattr(config, "mask_aware", None)
         self.mask_aware_enabled = bool(getattr(mask_cfg, "enabled", False))
@@ -320,24 +341,71 @@ class RealWorldDataset(Dataset):
         self.mask_empty_cloud_policy = str(getattr(mask_cfg, "empty_cloud_policy", "warn_and_skip"))
         self.mask_log_alignment_preview = bool(getattr(mask_cfg, "log_alignment_preview", True))
     
-    def register_projector(self, demo_path, calib_path):
-        # get calib_timestamp
-        with open(os.path.join(demo_path, "meta.json"), "r") as f:
+    def _resolve_calib_timestamp(self, demo_path):
+        # 优先使用配置中的任务级标定时间戳
+        if self.config_calib_timestamp is not None:
+            return self.config_calib_timestamp, "config:data.calib_timestamp"
+
+        # 回退到 scene 目录下的 meta.json
+        meta_path = os.path.join(demo_path, "meta.json")
+        if not os.path.exists(meta_path):
+            raise FileNotFoundError(
+                "Missing calib timestamp for scene={}. Please set data.calib_timestamp in config or provide meta.json at {}".format(
+                    os.path.basename(demo_path), meta_path
+                )
+            )
+
+        with open(meta_path, "r") as f:
             meta = json.load(f)
-        calib_timestamp = meta["calib_timestamp"]
-        calib_path = os.path.join(calib_path, "{}.npy".format(calib_timestamp))
+
+        if "calib_timestamp" not in meta:
+            raise KeyError(
+                "meta.json for scene={} does not contain 'calib_timestamp'. Please set data.calib_timestamp in config or fix {}".format(
+                    os.path.basename(demo_path), meta_path
+                )
+            )
+
+        calib_timestamp = str(meta["calib_timestamp"]).strip()
+        if calib_timestamp in ["", "null", "None"]:
+            raise ValueError(
+                "Invalid calib_timestamp in {} for scene={}: {}".format(
+                    meta_path, os.path.basename(demo_path), meta["calib_timestamp"]
+                )
+            )
+
+        return calib_timestamp, "meta.json"
+
+    def register_projector(self, demo_path, calib_path):
+        calib_timestamp, calib_source = self._resolve_calib_timestamp(demo_path)
+        # calib_file_path = os.path.join(calib_path, "{}.npy".format(calib_timestamp))
+        calib_file_path = os.path.join(calib_path, "rise2_calib_{}.npy".format(calib_timestamp))
+
+        if not os.path.exists(calib_file_path):
+            raise FileNotFoundError(
+                "Calibration file not found for scene={} (source={}, timestamp={}): {}".format(
+                    os.path.basename(demo_path), calib_source, calib_timestamp, calib_file_path
+                )
+            )
+
+        if demo_path not in self._calib_source_logged:
+            # print(
+            #     "[calib-select] scene={} source={} timestamp={}".format(
+            #         os.path.basename(demo_path), calib_source, calib_timestamp
+            #     )
+            # )
+            self._calib_source_logged.add(demo_path)
 
         if self.robot_type == "single":
             Projector = SingleArmProjector
         else:
             Projector = DualArmProjector
         if calib_timestamp not in self.projectors:
-            calib_file = np.load(calib_path, allow_pickle = True).item()
+            calib_file = np.load(calib_file_path, allow_pickle = True).item()
             cam_ids = calib_file["camera_serials_global"]
             # create projector cache
             self.projectors[calib_timestamp] = {}
             for cam_id in cam_ids:
-                self.projectors[calib_timestamp][cam_id] = Projector(calib_path, cam_id)
+                self.projectors[calib_timestamp][cam_id] = Projector(calib_file_path, cam_id)
         cam_ids = list(self.projectors[calib_timestamp].keys())
 
         return calib_timestamp, cam_ids
@@ -526,6 +594,8 @@ class RealWorldDataset(Dataset):
 
         # visualization
         if self.vis:
+            scene_name = os.path.basename(data_path)
+            vis_prefix = "{}_cam{}_obs{}_idx{}".format(scene_name, cam_id, obs_frame_id, index)
             vis_data(
                 points,
                 np.asarray(cloud.colors),
@@ -533,7 +603,12 @@ class RealWorldDataset(Dataset):
                 self.workspace_min,
                 self.workspace_max,
                 self.translation_min,
-                self.translation_max
+                self.translation_max,
+                save_dir = self.vis_save_dir,
+                save_prefix = vis_prefix,
+                save_png = self.vis_save_png,
+                save_ply = self.vis_save_ply,
+                force_offscreen = self.vis_force_offscreen,
             )
         
         # rotation transformation (to 6d)
