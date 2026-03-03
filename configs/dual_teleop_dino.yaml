@@ -101,7 +101,7 @@ mask_aware:
   r_min: 0.001
   interp_eps: 0.000001
   interp_tiny: 0.000001
-  empty_cloud_policy: warn_and_skip
+  empty_cloud_policy: warn_and_skip_filter
   log_alignment_preview: false
 
 

@@ -115,24 +115,6 @@ def _convert_joint_states_single(joint, num_robot_joints, is_rad=True):
     return {**joint_states, **gripper_states}
 
 
-def _forward_kinematic_single(joint, num_robot_joints, is_rad=True, urdf_file=None,
-                               with_visuals_map=True):
-    """
-    Compute forward kinematics for a single arm.
-
-    Returns
-    -------
-    transforms : dict[str, kinpy.transform.Transform]
-    visuals_map : dict (only when with_visuals_map=True)
-    """
-    model_chain = kp.build_chain_from_urdf(open(urdf_file, "rb").read())
-    joint_states = _convert_joint_states_single(joint, num_robot_joints, is_rad=is_rad)
-    if with_visuals_map:
-        return model_chain.forward_kinematics(joint_states), model_chain.visuals_map()
-    else:
-        return model_chain.forward_kinematics(joint_states)
-
-
 # ---------------------------------------------------------------------------
 # Renderer
 # ---------------------------------------------------------------------------
@@ -141,6 +123,13 @@ class SeparateRiseRobotRenderer:
     """
     URDF-based renderer for a dual-arm robot using two separate URDF files
     (one per arm). Renders the arm mesh into depth / mask images.
+
+    The kinpy model chains represent the robot's static kinematic structure
+    (parsed from URDF) and are built once in __init__.  Each call to
+    _update_geometry passes the current joint angles to chain.forward_kinematics(),
+    which returns the per-link transforms for that configuration.  There is no
+    need to rebuild the chain per frame — the chain itself is stateless with
+    respect to joint configuration.
 
     Parameters
     ----------
@@ -190,22 +179,19 @@ class SeparateRiseRobotRenderer:
         self.material = o3d.visualization.rendering.MaterialRecord()
         self.material.shader = "defaultLit"
 
-        # Build FK at zero pose to get visuals map
-        zero_joint = np.zeros(num_robot_joints + 1, dtype=np.float32)
-        cur_transforms_left, self.visuals_map_left = _forward_kinematic_single(
-            joint=zero_joint,
-            num_robot_joints=self.num_robot_joints,
-            is_rad=True,
-            urdf_file=self.urdf_left,
-            with_visuals_map=True,
-        )
-        cur_transforms_right, self.visuals_map_right = _forward_kinematic_single(
-            joint=zero_joint,
-            num_robot_joints=self.num_robot_joints,
-            is_rad=True,
-            urdf_file=self.urdf_right,
-            with_visuals_map=True,
-        )
+        # Build kinpy chains once from URDF (kinematic structure is static).
+        # chain.forward_kinematics(joint_states) is then called each frame with
+        # the current joint angles — the chain itself holds no joint state.
+        self.chain_left  = kp.build_chain_from_urdf(open(urdf_left,  "rb").read())
+        self.chain_right = kp.build_chain_from_urdf(open(urdf_right, "rb").read())
+        self.visuals_map_left  = self.chain_left.visuals_map()
+        self.visuals_map_right = self.chain_right.visuals_map()
+
+        # Populate initial scene at zero pose
+        zero_joint  = np.zeros(num_robot_joints + 1, dtype=np.float32)
+        zero_states = _convert_joint_states_single(zero_joint, num_robot_joints)
+        cur_transforms_left  = self.chain_left.forward_kinematics(zero_states)
+        cur_transforms_right = self.chain_right.forward_kinematics(zero_states)
         self.last_joints = (zero_joint.copy(), zero_joint.copy())
 
         # Load meshes and add to scene at initial pose
@@ -267,20 +253,11 @@ class SeparateRiseRobotRenderer:
             joints = self.last_joints
         left_joint, right_joint = joints
 
-        cur_transforms_left = _forward_kinematic_single(
-            joint=left_joint,
-            num_robot_joints=self.num_robot_joints,
-            is_rad=True,
-            urdf_file=self.urdf_left,
-            with_visuals_map=False,
-        )
-        cur_transforms_right = _forward_kinematic_single(
-            joint=right_joint,
-            num_robot_joints=self.num_robot_joints,
-            is_rad=True,
-            urdf_file=self.urdf_right,
-            with_visuals_map=False,
-        )
+        # Forward kinematics with the current joint angles, using cached chains
+        left_states  = _convert_joint_states_single(left_joint,  self.num_robot_joints)
+        right_states = _convert_joint_states_single(right_joint, self.num_robot_joints)
+        cur_transforms_left  = self.chain_left.forward_kinematics(left_states)
+        cur_transforms_right = self.chain_right.forward_kinematics(right_states)
 
         self.renderer.scene.clear_geometry()
 
@@ -335,7 +312,7 @@ class SeparateRiseRobotRenderer:
 
     def update_joints(self, left_joint, right_joint):
         """
-        Update arm joint states and re-render.
+        Update arm joint states and refresh the rendered scene.
 
         Parameters
         ----------

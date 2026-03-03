@@ -58,6 +58,8 @@ def _build_mask_aware_cfg(config):
         "infer_allow_none": True,
         "infer_none_policy": "no_mask_fallback",
         "empty_cloud_policy": "warn_and_skip_filter",
+        "urdf_left": None,
+        "urdf_right": None,
     }
     raw_cfg = getattr(config, "mask_aware", {})
     raw_cfg = dict(raw_cfg) if raw_cfg is not None else {}
@@ -440,14 +442,13 @@ def evaluate(args_override):
     if config.mask_aware.enabled and args.type == "local":
         try:
             from mask.renderer import SeparateRiseRobotRenderer
-            _urdf_left  = getattr(config.mask_aware, "urdf_left",
-                                  os.path.join("airexo", "airexo", "urdf_models", "robot", "left_robot.urdf"))
-            _urdf_right = getattr(config.mask_aware, "urdf_right",
-                                  os.path.join("airexo", "airexo", "urdf_models", "robot", "right_robot.urdf"))
-            # cam_to_left/right_base 由 DualArmProjector 在 calibration 阶段计算
+            _urdf_left  = config.mask_aware.urdf_left  or os.path.join("airexo", "airexo", "urdf_models", "robot", "left_robot.urdf")
+            _urdf_right = config.mask_aware.urdf_right or os.path.join("airexo", "airexo", "urdf_models", "robot", "right_robot.urdf")
+            # cam_to_left/right_base: DualArmProjector 把 camera→base 矩阵存在
+            # projector_left.camera_pose / projector_right.camera_pose 里
             _arm_renderer = SeparateRiseRobotRenderer(
-                cam_to_left_base  = projector.cam_to_left_base,
-                cam_to_right_base = projector.cam_to_right_base,
+                cam_to_left_base  = projector.projector_left.camera_pose,
+                cam_to_right_base = projector.projector_right.camera_pose,
                 intrinsic         = fake_intrinsics,   # 实际部署替换为 agent.intrinsics
                 width             = 1280,
                 height            = 720,
