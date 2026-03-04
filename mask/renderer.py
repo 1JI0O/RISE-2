@@ -28,12 +28,12 @@ robot_inhand.urdf 中 gripper 相关 link 的命名规律（均被排除）：
 
 import numpy as np
 
-from airexo.airexo.helpers.renderer import RobotRenderer
-from airexo.airexo.helpers.constants import (
+from airexo.helpers.renderer import RobotRenderer
+from airexo.helpers.constants import (
     O3D_RENDER_TRANSFORMATION,
     ROBOT_PREDEFINED_TRANSFORMATION,
 )
-from airexo.airexo.helpers import urdf_robot as _robot_helper
+from airexo.helpers import urdf_robot as _robot_helper
 
 # link 名中包含以下任意子串，则判定为 gripper 部件并跳过
 _GRIPPER_KEYWORDS = ("finger", "knuckle", "robotiq", "flange")
