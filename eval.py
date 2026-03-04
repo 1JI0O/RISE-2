@@ -12,7 +12,7 @@ from easydict import EasyDict as edict
 from utils.training import set_seed
 from utils.ensemble import EnsembleBuffer
 from remote_eval import WebsocketClientPolicy
-# from eval_agent import SingleArmAgent, DualArmAgent
+from eval_agent import SingleArmAgent, DualArmAgent
 from dataset.data_utils import resize_image, ImageProcessor
 from dataset.projector import SingleArmProjector, DualArmProjector
 
@@ -118,8 +118,9 @@ def _log_mask_fallback(step, reason, action):
     print(f"[mask-aware] step={step} reason={reason} action={action}")
 
 
-# ── 模块级 renderer 引用，由 evaluate() 在启动时初始化 ──
+# ── 模块级 renderer / agent 引用，由 evaluate() 在启动时初始化 ──
 _arm_renderer = None
+_agent = None
 
 
 def get_arm_joints(meta=None):
@@ -135,6 +136,26 @@ def get_arm_joints(meta=None):
 
     实际部署时在此对接机械臂 SDK（例如读取 Flexiv 的 joint_pos + gripper_width）。
     """
+    _ = meta  # 预留参数，当前通过 agent 直接读取机器人状态
+
+    if _agent is None:
+        return None
+
+    try:
+        # 调用 eval_agent.py 中 Agent 的统一接口
+        _, proprio_joint = _agent.get_proprio(with_joint = True)
+        proprio_joint = np.asarray(proprio_joint, dtype = np.float32).reshape(-1)
+    except Exception as exc:
+        print(f"[mask-aware] failed to get arm joints from eval agent: {exc}")
+        return None
+
+    # DualArmAgent: [left(7)+gripper, right(7)+gripper]
+    if proprio_joint.size >= 16:
+        left_joint = proprio_joint[:8].copy()
+        right_joint = proprio_joint[8:16].copy()
+        return left_joint, right_joint
+
+    # SingleArmAgent 或格式不匹配时，交由上层触发 no_mask_fallback
     return None
 
 
@@ -426,8 +447,11 @@ def evaluate(args_override):
     )
 
     # evaluation
-    # Agent = SingleArmAgent if config.robot_type == "single" else DualArmAgent
-    # agent = Agent(**config.deploy.agent)
+    Agent = SingleArmAgent if config.robot_type == "single" else DualArmAgent
+    agent = Agent(**config.deploy.agent)
+
+    global _agent
+    _agent = agent
 
     # ensemble buffer
     ensemble_buffer = EnsembleBuffer(mode = config.deploy.ensemble_mode)
