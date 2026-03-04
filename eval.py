@@ -401,7 +401,7 @@ def evaluate(args_override):
 
     # projector
     Projector = SingleArmProjector if config.robot_type == "single" else DualArmProjector
-    projector = Projector(args.calib, config.deploy.agent.camera_serial)
+    projector = Projector(args.calib_rise2, config.deploy.agent.camera_serial)
 
     # image processor
     image_enc = config.model.image_enc
@@ -444,8 +444,8 @@ def evaluate(args_override):
             from airexo.airexo.calibration.calib_info import CalibrationInfo
             # 标定与 notebook "直接用renderer" cell 完全一致
             cam_serial  = config.deploy.agent.camera_serial
-            calib_ts    = int(os.path.splitext(os.path.basename(args.calib))[0])
-            calib_info  = CalibrationInfo(os.path.dirname(args.calib), calib_ts)
+            calib_ts    = int(os.path.splitext(os.path.basename(args.calib_airexo))[0])
+            calib_info  = CalibrationInfo(os.path.dirname(args.calib_airexo), calib_ts)
             _urdf = config.mask_aware.urdf or os.path.join(
                 "airexo", "airexo", "urdf_models", "robot", "robot_inhand.urdf"
             )
@@ -664,7 +664,8 @@ def evaluate(args_override):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--type', action = 'store', type = str, help = 'evaluation type, choices: ["local", "remote"].', required = True, choices = ["local", "remote"])
-    parser.add_argument('--calib', action = 'store', type = str, help = 'calibration path', required = True)
+    parser.add_argument('--calib_airexo', action = 'store', type = str, help = 'airexo calibration path', required = True)
+    parser.add_argument('--calib_rise2', action = 'store', type = str, help = 'rise2 calibration path', required = True)
     parser.add_argument('--config', action = 'store', type = str, help = 'data and model config during training and deployment', required = True)
     parser.add_argument('--ckpt', action = 'store', type = str, help = 'checkpoint path', required = False, default = None)
     parser.add_argument('--host', action = 'store', type = str, help = 'server host address', required = False, default = "127.0.0.1")
