@@ -21,7 +21,6 @@ import cv2
 # test_color = "/data/haoxiang/realdata_rise2_ready/train/task_0014_user_0020_scene_0001_cfg_0001/cam_104122063550/color/1765000020748.png"
 # test_depth = "/data/haoxiang/realdata_rise2_ready/train/task_0014_user_0020_scene_0001_cfg_0001/cam_104122063550/depth/1765000020748.png"
 
-
 test_color = "/home/haoxiang/RISE-2/saved_test_data/color_0000.png"
 test_depth = "/home/haoxiang/RISE-2/saved_test_data/depth_0000.png"
 
@@ -36,7 +35,8 @@ fake_depth_scale = 1000.0
 
 default_args = edict({
     "type": "local",
-    "calib": "calib/",
+    "calib_rise2": "calib_rise2/",
+    "calib_airexo": "calib_airexo/",
     "config": "config/dual_teleop_dino.yaml",
     "ckpt": "logs/collect_toys",
     "host": "127.0.0.1",

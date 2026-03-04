@@ -2,7 +2,9 @@
 >>> data1 = np.load("1737548651048.npy",allow_pickle=True)
 >>> data2=np.load("rise2_calib_1737548651048.npy",allow_pickle=True)
 >>> print(data1)
-{'type': 'robot', 'camera_serials': ['105422061350', '104122064161', '104122061330'], 'camera_serials_global': ['105422061350'], 'camera_serial_inhand_left': '104122064161', 'camera_serial_inhand_right': '104122061330', 'intrinsics': {'105422061350': array([[912.4466 ,   0.     , 633.4127 ],
+{'type': 'robot', 'camera_serials': ['105422061350', '104122064161', '104122061330'], 'camera_serials_global': ['105422061350'], 'camera_serial_inhand_left': '104122064161', 'camera_serial_inhand_right': '104122061330', 
+'intrinsics': {'105422061350': 
+array([[912.4466 ,   0.     , 633.4127 ],
        [  0.     , 911.4704 , 364.21265],
        [  0.     ,   0.     ,   1.     ]], dtype=float32), '104122064161': array([[915.71423,   0.     , 638.86804],
        [  0.     , 915.29736, 357.55472],

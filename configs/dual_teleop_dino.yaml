@@ -87,7 +87,8 @@ deploy:
   ensemble_mode: new
   seed: 233
 
-  vis: false
+  vis: true
+  vis_save_dir : /data/haoxiang/logs/airexo_mask_task0013/vis_deploy_debug
 
 
 mask_aware:

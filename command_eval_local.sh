@@ -1,6 +1,7 @@
-python eval.py \
+python eval_rise2_dev_dataset.py \
 --type local \
---ckpt /data/haoxiang/logs/rise2_2601/policy_last.ckpt \
---calib_airexo /data/haoxiang/realdata_rise2_ready/calib/1765003071096.npy \
---calib_rise2 /data/haoxiang/realdata_rise2_ready/calib/rise2_calib_1737548651048.npy \
---config configs/single_rise1.yaml 
+--ckpt /data/haoxiang/logs/airexo_mask_task0013/policy_last.ckpt \
+--calib_airexo /data/haoxiang/data/airexo2/task_0013/calib/1737548651048.npy \
+--calib_rise2 /data/haoxiang/data/airexo2/task_0013/calib/rise2_calib_1737548651048.npy \
+--config configs/dual_teleop_dino.yaml
+
