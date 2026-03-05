@@ -30,7 +30,7 @@ data:
   repeat_dataset: 1
   
   # vis: true
-  # vis_save_dir: /data/haoxiang/logs/airexo_mask_task0013/vis_debug
+  # vis_save_dir: /data/haoxiang/logs/airexo_mask_task0013/vis_debug_3donly
   # vis_save_png: true
   # vis_save_ply: true
   # vis_force_offscreen: true
