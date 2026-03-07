@@ -3,6 +3,7 @@ import torch
 import numpy as np
 import open3d as o3d
 import torchvision.transforms as T
+import matplotlib.pyplot as plt
 
 from transforms3d.quaternions import quat2mat
 
@@ -36,6 +37,58 @@ def resize_image(image_list, image_size, interpolation = T.InterpolationMode.BIL
     image_list_resized = resize(image_list)
     return image_list_resized
 
+def _save_png_fallback(
+        points,
+        colors,
+        action_tcps,
+        workspace_min,
+        workspace_max,
+        translation_min,
+        translation_max,
+        png_path,
+    ):
+    max_points = 50000
+    if len(points) > max_points:
+        step = max(1, len(points) // max_points)
+        points_vis = points[::step]
+        colors_vis = colors[::step]
+    else:
+        points_vis = points
+        colors_vis = colors
+
+    fig = plt.figure(figsize = (12.8, 7.2), dpi = 100)
+    ax = fig.add_subplot(111, projection = "3d")
+    ax.scatter(
+        points_vis[:, 0],
+        points_vis[:, 1],
+        points_vis[:, 2],
+        c = np.clip(colors_vis, 0.0, 1.0),
+        s = 1,
+        marker = ".",
+        depthshade = False,
+    )
+
+    if action_tcps is not None and len(action_tcps) > 0:
+        ax.plot(action_tcps[:, 0], action_tcps[:, 1], action_tcps[:, 2], color = "yellow", linewidth = 2)
+        ax.scatter(action_tcps[:, 0], action_tcps[:, 1], action_tcps[:, 2], c = "yellow", s = 20)
+
+    if workspace_min is not None and workspace_max is not None:
+        ax.set_xlim(float(workspace_min[0]), float(workspace_max[0]))
+        ax.set_ylim(float(workspace_min[1]), float(workspace_max[1]))
+        ax.set_zlim(float(workspace_min[2]), float(workspace_max[2]))
+    elif translation_min is not None and translation_max is not None:
+        ax.set_xlim(float(translation_min[0]), float(translation_max[0]))
+        ax.set_ylim(float(translation_min[1]), float(translation_max[1]))
+        ax.set_zlim(float(translation_min[2]), float(translation_max[2]))
+
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_zlabel("z")
+    ax.view_init(elev = 25, azim = -60)
+    fig.tight_layout()
+    fig.savefig(png_path)
+    plt.close(fig)
+
 def vis_data(
         points,
         colors,
@@ -43,16 +96,30 @@ def vis_data(
         workspace_min = None,
         workspace_max = None,
         translation_min = None,
-        translation_max = None
+        translation_max = None,
+        save_dir = None,
+        save_prefix = None,
+        save_png = False,
+        save_ply = False,
+        force_offscreen = True,
     ):
     print(points.min(axis=0), points.max(axis=0))
-    contents = []
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok = True)
+
+    if save_prefix is None or len(str(save_prefix).strip()) == 0:
+        save_prefix = "vis"
+    save_prefix = str(save_prefix)
+
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points)
     pcd.colors = o3d.utility.Vector3dVector(colors)
-    contents.append(pcd)
+
+    contents = [pcd]
+
     # red box stands for the workspace range
-    if workspace_max is not None and workspace_max is not None:
+    if workspace_min is not None and workspace_max is not None:
         bbox3d_1 = o3d.geometry.AxisAlignedBoundingBox(workspace_min, workspace_max)
         bbox3d_1.color = [1, 0, 0]
         contents.append(bbox3d_1)
@@ -69,7 +136,95 @@ def vis_data(
             frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.03).transform(action)
             traj.append(frame)
         contents += traj
-    o3d.visualization.draw_geometries(contents)
+
+    # save point cloud first (headless-safe)
+    if save_ply and save_dir is not None:
+        # 参考旧注释版：导出“合并点云”而非仅主点云
+        # 这样离线查看时仍能看到 workspace / translation box 与 action 轨迹语义
+        combined_pcd = o3d.geometry.PointCloud()
+        combined_pcd += pcd
+
+        def _add_box_corners(min_pt, max_pt, color):
+            bbox = o3d.geometry.AxisAlignedBoundingBox(min_pt, max_pt)
+            box_points = np.asarray(bbox.get_box_points())
+            box_pcd = o3d.geometry.PointCloud()
+            box_pcd.points = o3d.utility.Vector3dVector(box_points)
+            box_pcd.paint_uniform_color(color)
+            return box_pcd
+
+        # red: workspace
+        if workspace_min is not None and workspace_max is not None:
+            combined_pcd += _add_box_corners(workspace_min, workspace_max, [1.0, 0.0, 0.0])
+
+        # green: translation normalization range
+        if translation_min is not None and translation_max is not None:
+            combined_pcd += _add_box_corners(translation_min, translation_max, [0.0, 1.0, 0.0])
+
+        # yellow: action tcp trajectory points
+        if action_tcps is not None and len(action_tcps) > 0:
+            action_pts = np.asarray(action_tcps)[:, :3]
+            act_pcd = o3d.geometry.PointCloud()
+            act_pcd.points = o3d.utility.Vector3dVector(action_pts)
+            act_pcd.paint_uniform_color([1.0, 1.0, 0.0])
+            combined_pcd += act_pcd
+
+        ply_path = os.path.join(save_dir, "{}.ply".format(save_prefix))
+        o3d.io.write_point_cloud(ply_path, combined_pcd)
+        print("[vis] saved ply: {}".format(ply_path))
+
+    # save screenshot if requested
+    if save_png and save_dir is not None:
+        png_path = os.path.join(save_dir, "{}.png".format(save_prefix))
+
+        # fully headless fallback: avoid Open3D window creation
+        if force_offscreen:
+            _save_png_fallback(
+                points,
+                colors,
+                action_tcps,
+                workspace_min,
+                workspace_max,
+                translation_min,
+                translation_max,
+                png_path,
+            )
+            print("[vis] saved png (matplotlib fallback): {}".format(png_path))
+        else:
+            vis = o3d.visualization.Visualizer()
+            try:
+                vis.create_window(window_name = "vis", width = 1280, height = 720, visible = True)
+                for geom in contents:
+                    vis.add_geometry(geom)
+                vis.poll_events()
+                vis.update_renderer()
+                ok = vis.capture_screen_image(png_path, do_render = True)
+                if ok:
+                    print("[vis] saved png: {}".format(png_path))
+                else:
+                    print("[vis] failed to save png: {}".format(png_path))
+            except Exception as e:
+                print("[vis] png capture failed, fallback to matplotlib: {}".format(e))
+                _save_png_fallback(
+                    points,
+                    colors,
+                    action_tcps,
+                    workspace_min,
+                    workspace_max,
+                    translation_min,
+                    translation_max,
+                    png_path,
+                )
+                print("[vis] saved png (matplotlib fallback): {}".format(png_path))
+            finally:
+                try:
+                    vis.destroy_window()
+                except Exception:
+                    pass
+
+    # fallback interactive view if not saving files
+    if not save_png and not save_ply:
+        o3d.visualization.draw_geometries(contents)
+
 
 
 class TrajLoader:

@@ -4,6 +4,7 @@ data:
   type: teleop
   num_action: 20
   voxel_size: 0.005
+  calib_timestamp: "1737548651048"
 
   sample_traj:
     enable: true
@@ -29,6 +30,11 @@ data:
   repeat_dataset: 1
   
   vis: false
+  # vis: true
+  # vis_save_dir: /data/haoxiang/logs/airexo_task0013_original/vis_debug
+  # vis_save_png: true
+  # vis_save_ply: true
+  # vis_force_offscreen: true
 
 
 train:
@@ -48,12 +54,20 @@ train:
     aug_color_prob: 0.2
   
   lr: 0.0003
-  batch_size: 240
+  batch_size: 180
   num_workers: 24
   num_steps: 60000
   save_steps: 2500
   num_warmup_steps: 2000
   seed: 233
+
+  # lr: 0.0003          # 这个无所谓，反正你不训练
+  # batch_size: 1       # 【关键】只看一个样本，秒出图
+  # num_workers: 0      # 【关键】关闭多进程，防止可视化假死和报错刷屏
+  # num_steps: 1        # 【关键】防止你关掉窗口后它真的开始训6万步
+  # save_steps: 2500    # 无所谓
+  # num_warmup_steps: 0 # 无所谓
+  # seed: 233           # 保持不变，确保每次 debug 看到的数据是一样的
 
 
 deploy:
