@@ -233,8 +233,6 @@ class RealWorldDataset(Dataset):
 
         return calib_timestamp, cam_ids
 
-        return calib_timestamp, cam_ids
-
     def _augmentation(self, points, image_coords, tcps):
         translation_offsets = np.random.rand(3) * (self.aug_trans_max - self.aug_trans_min) + self.aug_trans_min
         rotation_angles = np.random.rand(3) * (self.aug_rot_max - self.aug_rot_min) + self.aug_rot_min
