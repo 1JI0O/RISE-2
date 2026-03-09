@@ -4,10 +4,10 @@ Evaluation Agent.
 
 import time
 import numpy as np
-from device.arm import FlexivArm
-from device.camera import RealSenseRGBDCamera
+from easyrobot.arm.flexiv import FlexivArm
+from easyrobot.camera.realsense import RealSenseRGBDCamera
 from utils.transformation import xyz_rot_transform
-from device.gripper import Robotiq2F85Gripper, DahuanAG95Gripper
+from easyrobot.gripper.robotiq import Robotiq2F85Gripper
 
 
 class SingleArmAgent:
