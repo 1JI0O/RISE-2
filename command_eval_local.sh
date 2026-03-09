@@ -1,3 +1,4 @@
+PYTHONPATH=/home/haoxiang/rise2_mask_aware/airexo:${PYTHONPATH} \
 python eval_rise2_dev_dataset.py \
 --type local \
 --ckpt /data/haoxiang/logs/airexo_mask_task0013/policy_last.ckpt \

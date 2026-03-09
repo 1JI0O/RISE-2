@@ -12,7 +12,7 @@ from easydict import EasyDict as edict
 from utils.training import set_seed
 from utils.ensemble import EnsembleBuffer
 from remote_eval import WebsocketClientPolicy
-# from eval_agent import SingleArmAgent, DualArmAgent
+from eval_agent import SingleArmAgent, DualArmAgent
 from dataset.data_utils import resize_image, ImageProcessor
 from dataset.projector import SingleArmProjector, DualArmProjector
 
@@ -144,44 +144,50 @@ def _log_mask_fallback(step, reason, action):
 _arm_renderer = None
 
 
-def get_arm_joints(meta=None):
+def get_arm_joints(agent):
     """
-    预留接口：返回当前机械臂关节角。
+    通过真实 eval agent 读取双臂当前关节角和夹爪宽度。
 
     Returns
     -------
-    (left_joint, right_joint) : tuple of np.ndarray, shape (num_robot_joints+1,)
-        前 num_robot_joints 个元素为关节角（弧度），最后一个元素为夹爪宽度（米）。
+    (left_joint, right_joint) : tuple of np.ndarray, shape (8,)
+        前 7 个元素为关节角（弧度），最后一个元素为夹爪宽度（米）。
     None
         无法获取时返回 None，上层会触发 no_mask_fallback。
-
-    实际部署时在此对接机械臂 SDK（例如读取 Flexiv 的 joint_pos + gripper_width）。
     """
-    lowdim_path = test_low_dim
-    if meta is not None and hasattr(meta, "get"):
-        lowdim_path = meta.get("lowdim_path", lowdim_path)
+    if agent is None:
+        return None
 
     try:
-        lowdim_raw = np.load(lowdim_path, allow_pickle=True)
-        lowdim = lowdim_raw.item() if isinstance(lowdim_raw, np.ndarray) else lowdim_raw
+        if not (hasattr(agent, "left_robot") and hasattr(agent, "right_robot")):
+            raise ValueError("mask-aware renderer currently expects a dual-arm agent")
 
-        left_robot = np.asarray(lowdim["robot_left"], dtype=np.float32).reshape(-1)
-        right_robot = np.asarray(lowdim["robot_right"], dtype=np.float32).reshape(-1)
-        left_gripper = np.asarray(lowdim["gripper_left"], dtype=np.float32).reshape(-1)
-        right_gripper = np.asarray(lowdim["gripper_right"], dtype=np.float32).reshape(-1)
+        if getattr(agent, "gripper_key", "width") != "width":
+            raise ValueError("mask-aware renderer requires gripper_key='width'")
 
-        if left_gripper.size == 0 or right_gripper.size == 0:
-            return None
+        left_joint_pos = np.asarray(agent.left_robot.get_joint_pos(), dtype = np.float32).reshape(-1)
+        right_joint_pos = np.asarray(agent.right_robot.get_joint_pos(), dtype = np.float32).reshape(-1)
+        left_gripper_width = np.asarray(agent.left_gripper.get_states()["width"], dtype = np.float32).reshape(-1)
+        right_gripper_width = np.asarray(agent.right_gripper.get_states()["width"], dtype = np.float32).reshape(-1)
 
-        left_joint = np.concatenate([left_robot, np.array([left_gripper[0]], dtype=np.float32)])
-        right_joint = np.concatenate([right_robot, np.array([right_gripper[0]], dtype=np.float32)])
+        if left_joint_pos.size < 7 or right_joint_pos.size < 7:
+            raise ValueError(
+                f"dual-arm joint length mismatch: left={left_joint_pos.size}, right={right_joint_pos.size}"
+            )
+        if left_gripper_width.size < 1 or right_gripper_width.size < 1:
+            raise ValueError(
+                f"dual-arm gripper width length mismatch: left={left_gripper_width.size}, right={right_gripper_width.size}"
+            )
+
+        left_joint = np.concatenate([left_joint_pos[:7], left_gripper_width[:1]], axis = 0)
+        right_joint = np.concatenate([right_joint_pos[:7], right_gripper_width[:1]], axis = 0)
         return left_joint, right_joint
     except Exception as exc:
-        print(f"[mask-aware/3donly] failed to load arm joints from lowdim npy: {exc}")
+        print(f"[mask-aware/3donly] failed to read arm joints from eval agent: {exc}")
         return None
 
 
-def infer_mask(color, depth, proprio, meta):
+def infer_mask(color, depth, proprio, meta, agent = None):
     """
     通过 URDF 渲染当前机械臂姿态，返回像素级 mask。
 
@@ -192,7 +198,7 @@ def infer_mask(color, depth, proprio, meta):
     """
     if _arm_renderer is None:
         return None
-    joints = get_arm_joints(meta)
+    joints = get_arm_joints(agent)
     if joints is None:
         return None
     left_joint, right_joint = joints
@@ -242,22 +248,57 @@ def _normalize_mask01(mask, depth_shape, mask_cfg):
     return mask01
 
 
-def _safe_infer_mask(color, depth, proprio, meta, mask_cfg):
+def _safe_infer_mask(color, depth, proprio, meta, mask_cfg, agent = None):
     # 执行 infer_mask 并把异常统一转换为回退信号
     try:
-        raw_mask = infer_mask(color, depth, proprio, meta)
+        raw_mask = infer_mask(color, depth, proprio, meta, agent = agent)
     except Exception:
-        return None, "infer_exception"
+        return None, "infer_exception", None
 
     if raw_mask is None:
-        return None, "infer_none"
+        return None, "infer_none", None
 
     try:
         mask01 = _normalize_mask01(raw_mask, depth.shape[:2], mask_cfg)
     except Exception:
-        return None, "mask_invalid"
+        return None, "mask_invalid", raw_mask
 
-    return mask01, None
+    return mask01, None, raw_mask
+
+
+
+def _save_mask_visualization(colors, raw_mask, step, config):
+    if raw_mask is None:
+        return
+
+    vis_save_dir = getattr(config.deploy, "vis_save_dir", ".")
+    if vis_save_dir is None or len(str(vis_save_dir).strip()) == 0:
+        vis_save_dir = "."
+    os.makedirs(vis_save_dir, exist_ok = True)
+
+    vis_save_prefix = getattr(config.deploy, "vis_save_prefix", "vis_debug")
+    if vis_save_prefix is None or len(str(vis_save_prefix).strip()) == 0:
+        vis_save_prefix = "vis_debug"
+    vis_save_prefix = str(vis_save_prefix)
+
+    mask_np = np.asarray(raw_mask)
+    if mask_np.ndim == 3:
+        mask_np = mask_np[..., 0]
+    mask_u8 = ((mask_np > 0).astype(np.uint8) * 255)
+
+    overlay = np.asarray(colors, dtype = np.uint8).copy()
+    mask_bool = mask_u8 > 0
+    if np.any(mask_bool):
+        overlay_f32 = overlay.astype(np.float32)
+        overlay_f32[mask_bool] = 0.6 * overlay_f32[mask_bool] + 0.4 * np.array([255.0, 0.0, 0.0], dtype = np.float32)
+        overlay = np.clip(overlay_f32, 0, 255).astype(np.uint8)
+
+    mask_path = os.path.join(vis_save_dir, "{}_step_{:06d}_mask.png".format(vis_save_prefix, step))
+    overlay_path = os.path.join(vis_save_dir, "{}_step_{:06d}_mask_overlay.png".format(vis_save_prefix, step))
+    cv2.imwrite(mask_path, mask_u8)
+    cv2.imwrite(overlay_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+    print("[vis] saved mask: {}".format(mask_path))
+    print("[vis] saved mask overlay: {}".format(overlay_path))
 
 
 def load_test_obs(color_path, depth_path):
@@ -455,8 +496,8 @@ def evaluate(args_override):
     )
 
     # evaluation
-    # Agent = SingleArmAgent if config.robot_type == "single" else DualArmAgent
-    # agent = Agent(**config.deploy.agent)
+    Agent = SingleArmAgent if config.robot_type == "single" else DualArmAgent
+    agent = Agent(**config.deploy.agent)
 
     # ensemble buffer
     ensemble_buffer = EnsembleBuffer(mode = config.deploy.ensemble_mode)
@@ -470,7 +511,7 @@ def evaluate(args_override):
     if config.mask_aware.enabled and args.type == "local":
         try:
             from mask.renderer import ArmOnlyRobotRenderer
-            from airexo.airexo.calibration.calib_info import CalibrationInfo
+            from airexo.calibration.calib_info import CalibrationInfo
             # 标定与 notebook "直接用renderer" cell 完全一致
             cam_serial  = config.deploy.agent.camera_serial
             calib_ts    = int(os.path.splitext(os.path.basename(args.calib_airexo))[0])
@@ -510,21 +551,22 @@ def evaluate(args_override):
         for t in range(config.deploy.max_steps):
             if t % config.deploy.num_inference_steps == 0:
                 # pre-process inputs
-                # colors, depths = agent.get_global_observation()
-
-                colors, depths = load_test_obs(test_color, test_depth)
+                colors, depths = agent.get_global_observation()
 
                 # 本地推理启用 mask-aware 分支
                 mask_enabled = bool(config.mask_aware.enabled and args.type == "local")
-                mask01, mask_reason = None, None
+                mask01, mask_reason, raw_mask = None, None, None
                 if mask_enabled:
-                    mask01, mask_reason = _safe_infer_mask(
+                    mask01, mask_reason, raw_mask = _safe_infer_mask(
                         color = colors,
                         depth = depths,
                         proprio = None,
                         meta = {"step": t, "mode": args.type},
                         mask_cfg = config.mask_aware,
+                        agent = agent,
                     )
+                    if getattr(config.deploy, "vis", False) and raw_mask is not None:
+                        _save_mask_visualization(colors, raw_mask, t, config)
                     if mask01 is None:
                         reason = mask_reason or "unknown_infer_failure"
                         if reason in mask_stats:
@@ -542,11 +584,9 @@ def evaluate(args_override):
 
                 # create cloud inputs
                 create_input_kwargs = dict(
-                    # cam_intrinsics = agent.intrinsics,
-                    cam_intrinsics = fake_intrinsics,
+                    cam_intrinsics = agent.intrinsics,
                     config = config,
-                    # depth_scale = agent.camera.depth_scale,
-                    depth_scale = fake_depth_scale,
+                    depth_scale = agent.camera.depth_scale,
                     rescale_factor = 1.0,
                 )
                 coords, points, cloud = create_input(
@@ -586,8 +626,7 @@ def evaluate(args_override):
                     )
 
                 # create image inputs（2D 图像特征保持原样，不做 patch 重权重）
-                # image_coords = image_processor.get_image_coordinates(depths, agent.intrinsics, agent.camera.depth_scale)
-                image_coords = image_processor.get_image_coordinates(depths, fake_intrinsics, fake_depth_scale)
+                image_coords = image_processor.get_image_coordinates(depths, agent.intrinsics, agent.camera.depth_scale)
                 colors, image_coords = image_processor.preprocess_images(colors, image_coords)
 
                 # predict action（3D-only：image_mask_weight 始终为 None）
