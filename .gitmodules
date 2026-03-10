@@ -2,6 +2,10 @@
     path = dependencies/pytorch3d
     url = https://github.com/facebookresearch/pytorch3d.git
     ignore = all
+[submodule "dependencies/MinkowskiEngine"]
+    path = dependencies/MinkowskiEngine
+    url = https://github.com/StanfordVL/MinkowskiEngine.git
+    ignore = all
 [submodule "airexo"]
 	path = airexo
 	url = https://github.com/1JI0O/AirExo-2.git
