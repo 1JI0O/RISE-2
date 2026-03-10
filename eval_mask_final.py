@@ -41,7 +41,7 @@ default_args = edict({
     "type": "local",
     "calib_rise2": "calib_rise2/",
     "calib_airexo": "calib_airexo/",
-    "config": "configs/dual_teleop_dino_3donly.yaml",
+    "config": "config/dual_teleop_dino.yaml",
     "ckpt": "logs/collect_toys",
     "host": "127.0.0.1",
     "port": 8000
@@ -53,7 +53,7 @@ def _build_mask_aware_cfg(config):
     default_cfg = {
         "enabled": False,
         "enable_3d_filter": True,
-        "enable_2d_reweight": False,
+        "enable_2d_reweight": True,
         "mask_threshold": 0,
         "mask_white_is_untrusted": True,
         "r_min": 1e-3,
@@ -102,28 +102,10 @@ def _build_mask_aware_cfg(config):
     return edict(merged_cfg)
 
 
-def _validate_3donly_config(mask_cfg):
-    # 3D-only 模式：强制 enable_3d_filter=true，enable_2d_reweight=false
-    if not mask_cfg.enabled:
-        return
-    if not mask_cfg.enable_3d_filter:
-        raise ValueError(
-            "[3donly] config must have enable_3d_filter=true, "
-            "but got enable_3d_filter=false. "
-            "Use eval_rise2_dev_dataset.py for non-3d-filter mode."
-        )
-    if mask_cfg.enable_2d_reweight:
-        raise ValueError(
-            "[3donly] config must have enable_2d_reweight=false, "
-            "but got enable_2d_reweight=true. "
-            "Use eval_rise2_dev_dataset.py for full mask-aware mode."
-        )
-
-
 def _log_mask_aware_summary(mask_cfg):
     # 启动时打印一次配置摘要用于排查
     print(
-        "[mask-aware/3donly] enabled={} 3d_filter={} 2d_reweight={} threshold={} "
+        "[mask-aware] enabled={} 3d_filter={} 2d_reweight={} threshold={} "
         "none_policy={} empty_cloud_policy={}".format(
             mask_cfg.enabled,
             mask_cfg.enable_3d_filter,
@@ -137,7 +119,7 @@ def _log_mask_aware_summary(mask_cfg):
 
 def _log_mask_fallback(step, reason, action):
     # 异常回退统一日志输出
-    print(f"[mask-aware/3donly] step={step} reason={reason} action={action}")
+    print(f"[mask-aware] step={step} reason={reason} action={action}")
 
 
 # ── 模块级 renderer 引用，由 evaluate() 在启动时初始化 ──
@@ -183,7 +165,7 @@ def get_arm_joints(agent):
         right_joint = np.concatenate([right_joint_pos[:7], right_gripper_width[:1]], axis = 0)
         return left_joint, right_joint
     except Exception as exc:
-        print(f"[mask-aware/3donly] failed to read arm joints from eval agent: {exc}")
+        print(f"[mask-aware] failed to read arm joints from eval agent: {exc}")
         return None
 
 
@@ -214,7 +196,7 @@ def _to_numpy_mask(mask):
 
 
 def _normalize_mask01(mask, depth_shape, mask_cfg):
-    # 将 mask 规范到 depth 尺寸并转换为 float32 的 0/1
+    # 将输入 mask 统一到 [0, 1] 浮点二值图，1 表示不可信（需要屏蔽）
     mask_np = _to_numpy_mask(mask)
 
     if mask_np.ndim == 3:
@@ -312,6 +294,23 @@ def _save_mask_visualization(colors, mask01, step, config):
     print("[vis] saved mask overlay: {}".format(overlay_path))
 
 
+def _build_image_mask_weight(mask01, image_processor):
+    # 根据二维 mask 构建图像 patch 级可信度权重
+    try:
+        mask_tensor = torch.from_numpy(mask01[np.newaxis].astype(np.float32))
+        mask_tensor = resize_image(
+            mask_tensor,
+            image_processor.img_size,
+            interpolation = T.InterpolationMode.NEAREST,
+        )
+        mask_ratio = image_processor.image_coord_pooling(mask_tensor)
+        image_mask_weight = (1.0 - mask_ratio).clamp(0.0, 1.0).to(torch.float32)
+    except Exception:
+        return None
+
+    return image_mask_weight
+
+
 def load_test_obs(color_path, depth_path):
     # 1. 加载彩色图并转为 RGB (OpenCV 默认读入是 BGR)
     color_image = cv2.imread(color_path)
@@ -324,7 +323,7 @@ def load_test_obs(color_path, depth_path):
     depth_image = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
     if depth_image is None:
         raise ValueError(f"无法加载深度图: {depth_path}")
-
+    
     # 确保是 uint16。如果你的 PNG 是 8bit 的，需要根据量化比例转回 uint16 (通常单位是毫米)
     depth_image = depth_image.astype(np.uint16)
 
@@ -373,9 +372,9 @@ def create_input(colors, depths, cam_intrinsics, config, depth_scale = 1000.0, r
     """
     # create point cloud
     cloud = create_point_cloud(
-        colors,
-        depths,
-        cam_intrinsics,
+        colors, 
+        depths, 
+        cam_intrinsics, 
         config,
         depth_scale = depth_scale,
         rescale_factor = rescale_factor,
@@ -386,7 +385,7 @@ def create_input(colors, depths, cam_intrinsics, config, depth_scale = 1000.0, r
     coords = np.ascontiguousarray(points / config.data.voxel_size, dtype = np.int32)
 
     return coords, points, cloud
-
+    
 
 def create_batch(coords, points):
     """
@@ -435,9 +434,6 @@ def evaluate(args_override):
     config.data.normalization.trans_min = np.asarray(config.data.normalization.trans_min)
     config.data.normalization.trans_max = np.asarray(config.data.normalization.trans_max)
     config.mask_aware = _build_mask_aware_cfg(config)
-
-    # 3D-only 模式配置断言：必须 enable_3d_filter=true, enable_2d_reweight=false
-    _validate_3donly_config(config.mask_aware)
 
     # set seed
     set_seed(config.deploy.seed)
@@ -497,7 +493,7 @@ def evaluate(args_override):
         img_coord_size = config.data.aligner.img_coord_size_dinov3
     else:
         raise ValueError(f"Unknown image encoder: {image_enc}")
-
+    
     image_processor = ImageProcessor(
         img_size = img_size,
         img_coord_size = img_coord_size,
@@ -536,29 +532,31 @@ def evaluate(args_override):
                 left_joint_cfgs  = _left_cfg,
                 right_joint_cfgs = _right_cfg,
                 cam_to_base      = calib_info.get_camera_to_base(cam_serial),
-                # intrinsic        = calib_info.get_intrinsic(cam_serial),
+                # intrinsic = calib_info.get_intrinsic(cam_serial), # intrinsic = agent.intrinsics
                 intrinsic = agent.intrinsics,
                 urdf_file        = _urdf,
                 width=1280, height=720, near_plane=0.01, far_plane=100.0,
             )
-            print("[mask-aware/3donly] renderer initialized ({})".format(_urdf))
+            print("[mask-aware] renderer initialized ({})".format(_urdf))
         except Exception as _e:
-            print(f"[mask-aware/3donly] renderer init failed, mask disabled: {_e}")
+            print(f"[mask-aware] renderer init failed, mask disabled: {_e}")
             _arm_renderer = None
 
-    # 记录异常回退统计（3D-only 无 2D reweight，移除相关计数项）
+    # 记录异常回退统计
     mask_stats = {
         "infer_none": 0,
         "infer_exception": 0,
         "mask_invalid": 0,
         "empty_cloud_skip": 0,
+        "reweight_fallback": 0,
         "points_nonfinite": 0,
+        "weight_nonfinite": 0,
     }
 
     # evaluation rollout
     print("Ready for rollout. Press Enter to continue...")
     input()
-
+    
     with torch.inference_mode():
         for t in range(config.deploy.max_steps):
             if t % config.deploy.num_inference_steps == 0:
@@ -588,9 +586,9 @@ def evaluate(args_override):
                             raise RuntimeError(f"mask unavailable with fail_fast, reason={reason}")
                         _log_mask_fallback(t, reason, "no_mask_fallback")
 
-                # 3D-only：仅对深度图应用 mask，2D 特征不做处理
+                # 根据 mask 生成点云深度输入
                 depths_for_cloud = depths
-                if mask_enabled and mask01 is not None:
+                if mask_enabled and config.mask_aware.enable_3d_filter and mask01 is not None:
                     depths_for_cloud = depths.copy()
                     depths_for_cloud[mask01 > 0.5] = 0
 
@@ -623,6 +621,7 @@ def evaluate(args_override):
                 # 过滤后空点云回退
                 if (
                     mask_enabled
+                    and config.mask_aware.enable_3d_filter
                     and mask01 is not None
                     and points.shape[0] == 0
                 ):
@@ -637,11 +636,23 @@ def evaluate(args_override):
                         **create_input_kwargs,
                     )
 
-                # create image inputs（2D 图像特征保持原样，不做 patch 重权重）
+                # create image inputs
                 image_coords = image_processor.get_image_coordinates(depths, agent.intrinsics, agent.camera.depth_scale)
                 colors, image_coords = image_processor.preprocess_images(colors, image_coords)
 
-                # predict action（3D-only：image_mask_weight 始终为 None）
+                # 根据 mask 构建 patch 级可信度权重
+                image_mask_weight = None
+                if mask_enabled and config.mask_aware.enable_2d_reweight and mask01 is not None:
+                    image_mask_weight = _build_image_mask_weight(mask01, image_processor)
+                    if image_mask_weight is None:
+                        mask_stats["reweight_fallback"] += 1
+                        _log_mask_fallback(t, "reweight_build_failed", "disable_2d_reweight")
+                    elif not torch.isfinite(image_mask_weight).all():
+                        mask_stats["weight_nonfinite"] += 1
+                        _log_mask_fallback(t, "reweight_nonfinite", "disable_2d_reweight")
+                        image_mask_weight = None
+
+                # predict action
                 if args.type == "local":
                     import MinkowskiEngine as ME
                     coords_batch, feats_batch = create_batch(coords, points)
@@ -650,13 +661,15 @@ def evaluate(args_override):
 
                     colors = colors.unsqueeze(0).to(device)
                     image_coords = image_coords.unsqueeze(0).to(device)
+                    if image_mask_weight is not None:
+                        image_mask_weight = image_mask_weight.unsqueeze(0).to(device)
 
                     # predict
                     pred_raw_action = policy(
                         cloud_data,
                         colors,
                         image_coords,
-                        image_mask_weight = None,
+                        image_mask_weight = image_mask_weight,
                         actions = None,
                     ).squeeze(0).cpu().numpy()
 
@@ -673,39 +686,6 @@ def evaluate(args_override):
                 # unnormalize predicted actions
                 action = process_state(pred_raw_action, config, to_control = True)
 
-                # # visualization
-                # if config.deploy.vis:
-                #     vis_save_dir = getattr(config.deploy, "vis_save_dir", ".")
-                #     if vis_save_dir is None or len(str(vis_save_dir).strip()) == 0:
-                #         vis_save_dir = "."
-                #     os.makedirs(vis_save_dir, exist_ok = True)
-
-                #     vis_save_prefix = getattr(config.deploy, "vis_save_prefix", "vis_debug")
-                #     if vis_save_prefix is None or len(str(vis_save_prefix).strip()) == 0:
-                #         vis_save_prefix = "vis_debug"
-                #     vis_save_prefix = str(vis_save_prefix)
-
-                #     combined_cloud = o3d.geometry.PointCloud()
-                #     combined_cloud += cloud
-
-                #     tcp_points = []
-                #     for raw_tcp in action:
-                #         tcp_points.append(raw_tcp[:3])
-                #         if config.robot_type == "dual":
-                #             tcp_points.append(raw_tcp[10:13])
-
-                #     if len(tcp_points) > 0:
-                #         tcp_points = np.asarray(tcp_points, dtype = np.float64).reshape(-1, 3)
-                #         tcp_cloud = o3d.geometry.PointCloud()
-                #         tcp_cloud.points = o3d.utility.Vector3dVector(tcp_points)
-                #         tcp_cloud.paint_uniform_color([1.0, 1.0, 0.0])
-                #         combined_cloud += tcp_cloud
-
-                #     ply_path = os.path.join(vis_save_dir, "{}_step_{:06d}.ply".format(vis_save_prefix, t))
-                #     o3d.io.write_point_cloud(ply_path, combined_cloud)
-                #     print("[vis] saved ply: {}".format(ply_path))
-                #     input("press enter")
-
                 # visualization
                 if config.deploy.vis:
                     tcp_vis_list = []
@@ -717,7 +697,7 @@ def evaluate(args_override):
                             tcp_vis_list.append(tcp_vis_r)
                     o3d.visualization.draw_geometries([cloud, *tcp_vis_list])
                     input("press enter")
-
+                
                 # project action to base coordinate
                 if config.robot_type == "single":
                     action_tcp = projector.project_tcp_to_base_coord(action[..., :9], rotation_rep = "rotation_6d")
@@ -726,30 +706,32 @@ def evaluate(args_override):
                     action_left_tcp = projector.project_tcp_to_base_coord(action[..., :9], "left", rotation_rep = "rotation_6d")
                     action_right_tcp = projector.project_tcp_to_base_coord(action[..., 10:19], "right", rotation_rep = "rotation_6d")
                     action = np.concatenate([action_left_tcp, action[..., 9:10], action_right_tcp, action[..., 19:20]], axis = -1)
-
+                
                 # add to ensemble buffer
                 ensemble_buffer.add_action(action, t)
-
+            
             # get step action from ensemble buffer
             step_action = ensemble_buffer.get_action()
             # 这个是 config.deploy.num_inference_steps 这么多次循环完成后
             # 根据 ensemble_buffer 存的一串动作加权平均得到的
-
+            
             if step_action is None:   # no action in the buffer => no movement.
                 continue
-
-            # agent.action(step_action, rotation_rep = "rotation_6d")
+            
+            agent.action(step_action, rotation_rep = "rotation_6d")
             print(f"execute {step_action}")
-            input("enter")
+            # input("enter")
 
     print(
-        "[mask-aware/3donly] summary infer_none={} infer_exception={} mask_invalid={} "
-        "empty_cloud_skip={} points_nonfinite={}".format(
+        "[mask-aware] summary infer_none={} infer_exception={} mask_invalid={} "
+        "empty_cloud_skip={} reweight_fallback={} points_nonfinite={} weight_nonfinite={}".format(
             mask_stats["infer_none"],
             mask_stats["infer_exception"],
             mask_stats["mask_invalid"],
             mask_stats["empty_cloud_skip"],
+            mask_stats["reweight_fallback"],
             mask_stats["points_nonfinite"],
+            mask_stats["weight_nonfinite"],
         )
     )
 
