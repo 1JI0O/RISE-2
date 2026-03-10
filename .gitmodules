@@ -6,3 +6,6 @@
 	path = airexo
 	url = https://github.com/1JI0O/AirExo-2.git
     ignore = all
+[submodule "sam2"]
+	path = sam2
+	url = https://github.com/1JI0O/sam2.git
