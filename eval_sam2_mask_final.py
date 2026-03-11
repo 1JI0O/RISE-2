@@ -138,7 +138,7 @@ def _build_sam2_cfg(mask_aware_cfg):
         "arm_obj_id": 1,
         "gripper_obj_id": 2,
         "dilate_radius": 10,
-        "reset_every_n_steps": 30,
+        "reset_every_n_steps": 100,  # 控制步数（现在每步都有一帧观测 = 连续视频帧）
     }
 
     raw_cfg = getattr(mask_aware_cfg, "sam2", {})
@@ -222,6 +222,7 @@ def _init_sam2_runtime(sam2_cfg):
         "last_gripper_mask_raw": None,  # bool (H, W)，未膨胀
         "last_reset_frame_idx": 0,
         "last_fail_reason": None,
+        "last_frame_np": None,      # uint8 HWC，上一帧图像，用于重置时 conditioning frame 对齐
     }
 
 
@@ -249,7 +250,15 @@ def _preprocess_frame_for_sam2(predictor, frame_np, device):
 
 
 def _build_video_inference_state_from_np(predictor, frame_np):
-    """Manually construct a SAM2VideoPredictor inference_state from a single numpy frame."""
+    """Manually construct a SAM2VideoPredictor inference_state from a single numpy frame.
+
+    兼容层说明
+    ----------
+    此函数手工复现了 SAM2VideoPredictor.init_state() 的 state dict 构建逻辑
+    （sam2/sam2_video_predictor.py init_state 第 58-98 行），字段名完全对应。
+    如需升级 SAM2，需核对 init_state 的字段是否有增减；
+    _get_image_feature 为私有方法，升级时同样需验证其签名未改变。
+    """
     device = predictor.device
     frame_tensor = _preprocess_frame_for_sam2(predictor, frame_np, device)
     inference_state = {
@@ -473,6 +482,7 @@ def infer_mask(color, depth, proprio, meta, agent=None):
         _sam2_runtime["last_arm_mask_raw"]     = arm_raw
         _sam2_runtime["last_gripper_mask_raw"] = gripper_raw
         _sam2_runtime["last_reset_frame_idx"]  = 0
+        _sam2_runtime["last_frame_np"]         = color_np.copy()
         final = _compute_final_mask(arm_raw, gripper_raw, cfg.dilate_radius)
         return (final.astype(np.uint8) * 255)
 
@@ -490,9 +500,18 @@ def infer_mask(color, depth, proprio, meta, agent=None):
     )
 
     if need_reset:
-        # 用上一帧 raw mask 重建 inference_state，限制显存增长
+        # 时序对齐修复：
+        #   conditioning frame 必须与其 mask 来自同一帧（frame N-1）。
+        #   若用当前帧（N）图像 + 上一帧（N-1）mask，propagate 会直接返回 conditioning 输出
+        #   （前一帧 mask），完全不利用当前帧视觉特征。
+        #   正确做法：frame N-1 图像 + frame N-1 mask → 对齐后追加 frame N → propagate(1→N)
+        last_frame_np = _sam2_runtime.get("last_frame_np")
         try:
-            inference_state = _build_video_inference_state_from_np(predictor, color_np)
+            if last_frame_np is not None:
+                inference_state = _build_video_inference_state_from_np(predictor, last_frame_np)
+            else:
+                # fallback（理论上 last_frame_np 冷启动后始终有值）
+                inference_state = _build_video_inference_state_from_np(predictor, color_np)
             with torch.inference_mode():
                 predictor.add_new_mask(
                     inference_state, frame_idx=0,
@@ -505,10 +524,12 @@ def infer_mask(color, depth, proprio, meta, agent=None):
                         obj_id=cfg.gripper_obj_id,
                         mask=torch.tensor(gripper_raw_prev, device=predictor.device),
                     )
-            _sam2_runtime["inference_state"]   = inference_state
-            _sam2_runtime["frame_idx"]         = 0
-            _sam2_runtime["last_reset_frame_idx"] = 0
-            frame_idx = 0
+            # 追加当前帧作为 frame_idx=1，让 propagate 从 N-1 正常传播到 N
+            _append_frame_to_video_state(predictor, inference_state, color_np)
+            _sam2_runtime["inference_state"]      = inference_state
+            _sam2_runtime["frame_idx"]            = 1
+            _sam2_runtime["last_reset_frame_idx"] = 1
+            frame_idx = 1
         except Exception:
             _sam2_runtime["last_fail_reason"] = "sam2_reset_exception"
             return None
@@ -549,6 +570,7 @@ def infer_mask(color, depth, proprio, meta, agent=None):
     _sam2_runtime["last_arm_mask_raw"] = arm_raw
     if gripper_raw is not None:
         _sam2_runtime["last_gripper_mask_raw"] = gripper_raw
+    _sam2_runtime["last_frame_np"] = color_np.copy()
 
     final = _compute_final_mask(arm_raw, gripper_raw, cfg.dilate_radius)
     return (final.astype(np.uint8) * 255)
@@ -896,46 +918,49 @@ def evaluate(args_override):
     # evaluation rollout
     print("Ready for rollout. Press Enter to continue...")
     input()
-    
+
+    # mask_enabled 在 rollout 开始前确定一次（rollout 期间不变）
+    mask_enabled = bool(
+        config.mask_aware.enabled
+        and args.type == "local"
+        and (_sam2_runtime is not None)
+    )
+    mask01 = None   # 每步由 SAM2 更新；推理步直接使用当前帧的 mask
+
     with torch.inference_mode():
         for t in range(config.deploy.max_steps):
-            if t % config.deploy.num_inference_steps == 0:
-                # pre-process inputs
-                colors, depths = agent.get_global_observation()
+            # ── 每步都采一次观测 ──────────────────────────────────────────────
+            colors_raw, depths = agent.get_global_observation()
 
-                # 本地推理启用 mask-aware 分支（SAM2 runtime 成功初始化后才进入）
-                mask_enabled = bool(
-                    config.mask_aware.enabled
-                    and args.type == "local"
-                    and (_sam2_runtime is not None)
+            # ── 每步都推 SAM2（连续帧跟踪，保持时序 memory 有效） ─────────────
+            if mask_enabled:
+                mask01, mask_reason, raw_mask = _safe_infer_mask(
+                    color = colors_raw,
+                    depth = depths,
+                    proprio = None,
+                    meta = {"step": t, "mode": args.type},
+                    mask_cfg = config.mask_aware,
+                    agent = agent,
                 )
-                mask01, mask_reason, raw_mask = None, None, None
-                if mask_enabled:
-                    mask01, mask_reason, raw_mask = _safe_infer_mask(
-                        color = colors,
-                        depth = depths,
-                        proprio = None,
-                        meta = {"step": t, "mode": args.type},
-                        mask_cfg = config.mask_aware,
-                        agent = agent,
-                    )
-                    if getattr(config.deploy, "vis", False) and mask01 is not None:
-                        _save_mask_visualization(colors, mask01, t, config)
-                    if mask01 is None:
-                        reason = mask_reason or "unknown_infer_failure"
-                        if reason in mask_stats:
-                            mask_stats[reason] += 1
-
-                        if _sam2_runtime is not None:
-                            runtime_reason = _sam2_runtime.get("last_fail_reason", None)
-                            if runtime_reason in mask_stats:
-                                mask_stats[runtime_reason] += 1
-
+                if getattr(config.deploy, "vis", False) and mask01 is not None:
+                    _save_mask_visualization(colors_raw, mask01, t, config)
+                if mask01 is None:
+                    reason = mask_reason or "unknown_infer_failure"
+                    if reason in mask_stats:
+                        mask_stats[reason] += 1
+                    if _sam2_runtime is not None:
+                        runtime_reason = _sam2_runtime.get("last_fail_reason", None)
+                        if runtime_reason in mask_stats:
+                            mask_stats[runtime_reason] += 1
+                    # fail_fast / log 仅在推理步触发（非推理步 mask 失败不影响 policy）
+                    if t % config.deploy.num_inference_steps == 0:
                         if config.mask_aware.infer_none_policy == "fail_fast":
                             _log_mask_fallback(t, reason, "fail_fast")
                             raise RuntimeError(f"mask unavailable with fail_fast, reason={reason}")
                         _log_mask_fallback(t, reason, "no_mask_fallback")
 
+            # ── 只在推理步做点云/图像处理 + policy + buffer ───────────────────
+            if t % config.deploy.num_inference_steps == 0:
                 # 根据 mask 生成点云深度输入
                 depths_for_cloud = depths
                 if mask_enabled and config.mask_aware.enable_3d_filter and mask01 is not None:
@@ -950,7 +975,7 @@ def evaluate(args_override):
                     rescale_factor = 1.0,
                 )
                 coords, points, cloud = create_input(
-                    colors,
+                    colors_raw,
                     depths_for_cloud,
                     **create_input_kwargs,
                 )
@@ -963,7 +988,7 @@ def evaluate(args_override):
                     mask_stats["points_nonfinite"] += 1
                     _log_mask_fallback(t, "points_nonfinite", "rebuild_from_original_depth")
                     coords, points, cloud = create_input(
-                        colors,
+                        colors_raw,
                         depths,
                         **create_input_kwargs,
                     )
@@ -981,14 +1006,14 @@ def evaluate(args_override):
                     mask_stats["empty_cloud_skip"] += 1
                     _log_mask_fallback(t, "empty_cloud_after_3d_filter", "skip_filter_rebuild")
                     coords, points, cloud = create_input(
-                        colors,
+                        colors_raw,
                         depths,
                         **create_input_kwargs,
                     )
 
-                # create image inputs
+                # create image inputs（colors_raw 保持不变，colors_proc 仅 policy 使用）
                 image_coords = image_processor.get_image_coordinates(depths, agent.intrinsics, agent.camera.depth_scale)
-                colors, image_coords = image_processor.preprocess_images(colors, image_coords)
+                colors_proc, image_coords = image_processor.preprocess_images(colors_raw, image_coords)
 
                 # 根据 mask 构建 patch 级可信度权重
                 image_mask_weight = None
@@ -1009,7 +1034,7 @@ def evaluate(args_override):
                     coords_batch, feats_batch = coords_batch.to(device), feats_batch.to(device)
                     cloud_data = ME.SparseTensor(feats_batch, coords_batch)
 
-                    colors = colors.unsqueeze(0).to(device)
+                    colors_proc = colors_proc.unsqueeze(0).to(device)
                     image_coords = image_coords.unsqueeze(0).to(device)
                     if image_mask_weight is not None:
                         image_mask_weight = image_mask_weight.unsqueeze(0).to(device)
@@ -1017,7 +1042,7 @@ def evaluate(args_override):
                     # predict
                     pred_raw_action = policy(
                         cloud_data,
-                        colors,
+                        colors_proc,
                         image_coords,
                         image_mask_weight = image_mask_weight,
                         actions = None,
@@ -1027,7 +1052,7 @@ def evaluate(args_override):
                     obs_dict = {
                         "coords": coords,
                         "points": points,
-                        "colors": colors.numpy(),
+                        "colors": colors_proc.numpy(),
                         "image_coords": image_coords.numpy()
                     }
 
@@ -1047,7 +1072,7 @@ def evaluate(args_override):
                             tcp_vis_list.append(tcp_vis_r)
                     o3d.visualization.draw_geometries([cloud, *tcp_vis_list])
                     input("press enter")
-                
+
                 # project action to base coordinate
                 if config.robot_type == "single":
                     action_tcp = projector.project_tcp_to_base_coord(action[..., :9], rotation_rep = "rotation_6d")
@@ -1056,18 +1081,18 @@ def evaluate(args_override):
                     action_left_tcp = projector.project_tcp_to_base_coord(action[..., :9], "left", rotation_rep = "rotation_6d")
                     action_right_tcp = projector.project_tcp_to_base_coord(action[..., 10:19], "right", rotation_rep = "rotation_6d")
                     action = np.concatenate([action_left_tcp, action[..., 9:10], action_right_tcp, action[..., 19:20]], axis = -1)
-                
+
                 # add to ensemble buffer
                 ensemble_buffer.add_action(action, t)
-            
+
             # get step action from ensemble buffer
             step_action = ensemble_buffer.get_action()
             # 这个是 config.deploy.num_inference_steps 这么多次循环完成后
             # 根据 ensemble_buffer 存的一串动作加权平均得到的
-            
+
             if step_action is None:   # no action in the buffer => no movement.
                 continue
-            
+
             agent.action(step_action, rotation_rep = "rotation_6d")
             print(f"execute {step_action}")
             # input("enter")
