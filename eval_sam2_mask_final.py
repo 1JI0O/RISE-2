@@ -139,6 +139,7 @@ def _build_sam2_cfg(mask_aware_cfg):
         "gripper_obj_id": 2,
         "dilate_radius": 10,
         "reset_every_n_steps": 100,  # 控制步数（现在每步都有一帧观测 = 连续视频帧）
+        "remote_port": None,         # 若设置（如 8765），走 WebSocket 模式；None = 本地模式
     }
 
     raw_cfg = getattr(mask_aware_cfg, "sam2", {})
@@ -158,6 +159,8 @@ def _build_sam2_cfg(mask_aware_cfg):
         merged_cfg["gripper_obj_id"] = int(merged_cfg["gripper_obj_id"])
         merged_cfg["dilate_radius"] = int(merged_cfg["dilate_radius"])
         merged_cfg["reset_every_n_steps"] = int(merged_cfg["reset_every_n_steps"])
+        if merged_cfg["remote_port"] is not None:
+            merged_cfg["remote_port"] = int(merged_cfg["remote_port"])
     except Exception as exc:
         print(f"[mask-aware/sam2] invalid config, fallback to disabled: {exc}")
         merged_cfg = deepcopy(default_cfg)
@@ -203,7 +206,35 @@ def _resolve_sam2_device(device_str):
     raise ValueError(f"unsupported sam2 device: {device_str}")
 
 
+def _init_sam2_remote_client(port):
+    """Connect to sam2_mask_server running in the sam2 conda environment."""
+    import time
+    import websockets.sync.client
+    from remote_eval import msgpack_numpy as _mnp
+
+    uri = f"ws://127.0.0.1:{port}"
+    packer = _mnp.Packer()
+    while True:
+        try:
+            conn = websockets.sync.client.connect(uri, compression=None, max_size=None)
+            _mnp.unpackb(conn.recv())   # wait for {"status": "ready"} handshake
+            print(f"[mask-aware/sam2] connected to remote server at {uri}")
+            return {
+                "mode":             "remote",
+                "enabled":          True,
+                "conn":             conn,
+                "packer":           packer,
+                "last_fail_reason": None,
+            }
+        except ConnectionRefusedError:
+            print(f"[mask-aware/sam2] waiting for sam2 server on port {port}...")
+            time.sleep(2)
+
+
 def _init_sam2_runtime(sam2_cfg):
+    if getattr(sam2_cfg, "remote_port", None) is not None:
+        return _init_sam2_remote_client(sam2_cfg.remote_port)
+
     device = _resolve_sam2_device(sam2_cfg.device)
     predictor = build_sam2_video_predictor(
         config_file=sam2_cfg.config_file,
@@ -452,6 +483,23 @@ def infer_mask(color, depth, proprio, meta, agent=None):
     if _sam2_runtime is None or not bool(_sam2_runtime.get("enabled", False)):
         return None
 
+    # ── remote 模式：通过 WebSocket 转发给 sam2 conda 环境的服务端 ─────────────
+    if _sam2_runtime.get("mode") == "remote":
+        from remote_eval import msgpack_numpy as _mnp
+        color_np = np.asarray(color)
+        if color_np.dtype != np.uint8:
+            color_np = np.clip(color_np, 0, 255).astype(np.uint8)
+        try:
+            _sam2_runtime["conn"].send(_sam2_runtime["packer"].pack({"color": color_np}))
+            resp = _mnp.unpackb(_sam2_runtime["conn"].recv())
+            _sam2_runtime["last_fail_reason"] = resp.get("reason")
+            return resp.get("mask")   # uint8 (H,W) 或 None
+        except Exception as exc:
+            _sam2_runtime["last_fail_reason"] = "sam2_remote_exception"
+            print(f"[mask-aware/sam2] remote call failed: {exc}")
+            return None
+
+    # ── local 模式 ────────────────────────────────────────────────────────────
     cfg = _sam2_runtime["cfg"]
     _sam2_runtime["last_fail_reason"] = None
 

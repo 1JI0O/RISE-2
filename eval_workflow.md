@@ -1,515 +1,523 @@
-# eval_mask_final.py — 完整推理工作流文档
+# SAM2 在 Eval 流程中的完整工作流程
 
-> 文件路径：`sam2/eval_mask_final.py`
-> 最后更新：2026-03-10
+> 文件：`sam2/eval_mask_final.py`，服务端：`sam2/sam2_mask_server.py`
+> 最后更新：2026-03
 
 ---
 
 ## 目录
 
-1. [整体架构](#1-整体架构)
-2. [启动与配置加载](#2-启动与配置加载)
-3. [模型与组件初始化](#3-模型与组件初始化)
-4. [SAM2 Runtime 初始化](#4-sam2-runtime-初始化)
-5. [Rollout 主循环](#5-rollout-主循环)
-6. [SAM2 分割流程详解](#6-sam2-分割流程详解)
-   - [6.1 冷启动：首帧交互标注](#61-冷启动首帧交互标注)
-   - [6.2 后续帧：在线流式推理](#62-后续帧在线流式推理)
-   - [6.3 周期重置机制](#63-周期重置机制)
-   - [6.4 最终 mask 合成](#64-最终-mask-合成)
-7. [Mask 规范化与下游使用](#7-mask-规范化与下游使用)
-8. [3D 点云过滤分支](#8-3d-点云过滤分支)
-9. [2D 图像 patch 重权分支](#9-2d-图像-patch-重权分支)
-10. [策略推理与动作预测](#10-策略推理与动作预测)
-11. [动作投影与 Ensemble](#11-动作投影与-ensemble)
-12. [回退逻辑与异常统计](#12-回退逻辑与异常统计)
-13. [配置参考](#13-配置参考)
-14. [关键数据类型速查](#14-关键数据类型速查)
+1. [整体架构概览](#1-整体架构概览)
+2. [启动初始化](#2-启动初始化)
+3. [Rollout 主循环结构](#3-rollout-主循环结构)
+4. [SAM2 推理详解](#4-sam2-推理详解)
+   - 4.1 [冷启动：首帧交互标注](#41-冷启动首帧交互标注)
+   - 4.2 [后续帧：流式追帧 + propagate](#42-后续帧流式追帧--propagate)
+   - 4.3 [周期重置：显存管理](#43-周期重置显存管理)
+   - 4.4 [Mask 合成：arm 膨胀减去 gripper](#44-mask-合成arm-膨胀减去-gripper)
+5. [Mask 在下游的两个用途](#5-mask-在下游的两个用途)
+   - 5.1 [3D 点云过滤](#51-3d-点云过滤)
+   - 5.2 [2D 图像 Patch 权重重加权](#52-2d-图像-patch-权重重加权)
+6. [异常处理与回退机制](#6-异常处理与回退机制)
+7. [跨 Conda 环境部署：WebSocket 服务模式](#7-跨-conda-环境部署websocket-服务模式)
+8. [完整时间线示例](#8-完整时间线示例)
+9. [配置参数参考](#9-配置参数参考)
+10. [统计计数器说明](#10-统计计数器说明)
 
 ---
 
-## 1. 整体架构
+## 1. 整体架构概览
 
 ```
-evaluate()
-│
-├─ 配置加载 (_build_mask_aware_cfg / _build_sam2_cfg)
-├─ 策略模型加载 (RISE2)
-├─ 投影器 Projector 初始化
-├─ ImageProcessor 初始化
-├─ Robot Agent 初始化
-├─ EnsembleBuffer 初始化
-├─ SAM2 VideoPredictor Runtime 初始化 (_init_sam2_runtime)
-│
-└─ Rollout 主循环 (for t in range(max_steps))
-    │
-    ├─ [每 num_inference_steps 步执行一次策略推理]
-    │   │
-    │   ├─ 获取观测 agent.get_global_observation() → colors, depths
-    │   │
-    │   ├─ SAM2 分割 (_safe_infer_mask)
-    │   │   ├─ [首帧] _cold_start_interactive (cv2 交互标注)
-    │   │   └─ [后续] propagate_in_video (VideoPredictor 跟踪)
-    │   │
-    │   ├─ 3D 点云过滤 (mask01 → 零化机械臂深度像素)
-    │   ├─ create_input → coords, points, cloud (MinkowskiEngine 稀疏张量)
-    │   ├─ 2D patch 重权 (_build_image_mask_weight)
-    │   ├─ 策略前向 policy(cloud_data, colors, image_coords, image_mask_weight)
-    │   ├─ 动作反归一化 process_state
-    │   ├─ 坐标投影 projector.project_tcp_to_base_coord
-    │   └─ ensemble_buffer.add_action
-    │
-    └─ ensemble_buffer.get_action → agent.action (每步执行)
+┌─────────────────────────────────────────────────────────────────┐
+│                      evaluate() 主循环                           │
+│                                                                  │
+│  for t in range(max_steps):                                      │
+│                                                                  │
+│    ① agent.get_global_observation()  ← 每步采一次 RGB-D         │
+│                                                                  │
+│    ② SAM2 推理（每步都执行）                                      │
+│       infer_mask(color, depth, ...)                              │
+│       → mask01: float32 (H,W)，1=机械臂区域，0=其余             │
+│                                                                  │
+│    ③ 仅推理步（t % num_inference_steps == 0）执行：              │
+│       • 3D: 深度图中机械臂像素置0 → 点云只含场景                  │
+│       • policy 预测动作序列 (H, action_dim)                      │
+│       • 2D: image patch 权重（机械臂区域权重降低）               │
+│       • EnsembleBuffer.add_action()                              │
+│                                                                  │
+│    ④ 每步从 buffer 取动作并下发                                   │
+│       EnsembleBuffer.get_action() → agent.action()              │
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+**关键设计**：SAM2 **每步都运行**（维持时序 memory 连续性），但 policy 推理只在 `t % num_inference_steps == 0` 时触发，使用当步的 mask。
 
 ---
 
-## 2. 启动与配置加载
+## 2. 启动初始化
 
-### 入口
+`evaluate()` 函数在进入 rollout 循环前依次完成：
 
-```bash
-python sam2/eval_mask_final.py \
-    --type local \
-    --calib_rise2 calib_rise2/ \
-    --calib_airexo calib_airexo/ \
-    --config config/dual_teleop_dino.yaml \
-    --ckpt logs/collect_toys
-```
-
-### 配置层次
-
-```
-config (YAML)
-└── mask_aware
-    ├── enabled            bool    是否启用 mask-aware 推理
-    ├── enable_3d_filter   bool    是否用 mask 过滤深度图（屏蔽机械臂点云）
-    ├── enable_2d_reweight bool    是否用 mask 构建 patch 可信度权重
-    ├── mask_threshold     float   mask 二值化阈值（默认 0）
-    ├── mask_white_is_untrusted bool  像素值 > threshold 为不可信（机械臂区域）
-    ├── r_min              float   插值最小半径（1e-3）
-    ├── interp_eps / interp_tiny float  数值稳定防零
-    ├── infer_none_policy  str     "no_mask_fallback" | "fail_fast"
-    ├── empty_cloud_policy str     "warn_and_skip_filter" | "fail_fast"
-    └── sam2
-        ├── enabled              bool    是否启用 SAM2
-        ├── config_file          str     SAM2 模型配置 yaml
-        ├── ckpt_path            str     微调权重路径
-        ├── device               str     "cuda_if_available" | "cuda" | "cpu" | "mps"
-        ├── arm_obj_id           int     机械臂对象 ID（默认 1）
-        ├── gripper_obj_id       int     Gripper 对象 ID（默认 2）
-        ├── dilate_radius        int     arm/gripper mask 膨胀半径（像素，默认 10）
-        └── reset_every_n_steps  int     每 N 帧重置 inference_state（默认 30）
-```
-
-`_build_mask_aware_cfg` 和 `_build_sam2_cfg` 负责从 YAML 合并默认值并做类型校验，任何解析异常都会 fallback 为禁用。
-
----
-
-## 3. 模型与组件初始化
-
-### 策略模型 RISE2
-
-- `args.type == "local"` 时本地加载 `RISE2`
-- 支持单臂（`action_dim=10`）和双臂（`action_dim=20`）
-- `policy.load_state_dict(..., strict=False)` 加载微调权重
-- `policy.eval()` 切入推理模式
-
-### Projector（TCP 坐标投影器）
-
-- `SingleArmProjector` / `DualArmProjector`
-- 使用 rise2 标定文件将相机系 TCP 转为机器人基坐标系
-
-### ImageProcessor
-
-- 根据 image_enc 类型（`resnet18` / `dinov2*` / `dinov3*`）选择对应分辨率
-- 负责图像预处理：`preprocess_images` → resize + normalize
-- `get_image_coordinates(depth, intrinsics, depth_scale)` → 图像坐标
-- `image_coord_pooling` → patch 级 mask 比例（用于 2D reweight）
-
-### Robot Agent
-
-- `SingleArmAgent` / `DualArmAgent`
-- `agent.get_global_observation()` → `(colors: np.uint8 HWC, depths: np.uint16 HW)`
-- `agent.action(step_action)` → 发送关节控制指令
-- `agent.intrinsics` → 相机内参矩阵（3×3）
-- `agent.camera.depth_scale` → 深度单位换算系数
-
-### EnsembleBuffer
-
-- 存储最近若干步预测动作序列
-- `add_action(action, t)` → 缓冲加权
-- `get_action()` → 按 ensemble_mode 加权平均当前步动作
-
----
-
-## 4. SAM2 Runtime 初始化
-
-### 条件
-
-仅在以下条件全部满足时初始化：
-- `config.mask_aware.enabled == True`
-- `args.type == "local"`
-- `config.mask_aware.sam2.enabled == True`
-
-### 流程
+### 2.1 配置加载
 
 ```python
-_sam2_runtime = _init_sam2_runtime(config.mask_aware.sam2)
+config.mask_aware = _build_mask_aware_cfg(config)
+config.mask_aware.sam2 = _build_sam2_cfg(config.mask_aware)
 ```
 
-`_init_sam2_runtime` 内部：
+SAM2 配置的完整字段（含默认值）：
 
-1. `_resolve_sam2_device(device_str)` → 解析设备（cuda / mps / cpu，带可用性检测）
-2. `build_sam2_video_predictor(config_file, ckpt_path, device, mode="eval")` → 加载微调后的 SAM2VideoPredictor
-3. 返回 runtime 字典（模块级全局变量 `_sam2_runtime`）：
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `enabled` | `true` | SAM2 总开关 |
+| `config_file` | `configs/sam2.1/sam2.1_hiera_b+.yaml` | SAM2 模型结构配置 |
+| `ckpt_path` | `checkpoints/sam2.1_hiera_base_plus.pt` | 微调权重路径 |
+| `device` | `cuda_if_available` | 推理设备 |
+| `arm_obj_id` | `1` | VideoPredictor 中机械臂的 obj_id |
+| `gripper_obj_id` | `2` | VideoPredictor 中 gripper 的 obj_id |
+| `dilate_radius` | `10` | arm/gripper mask 膨胀半径（像素） |
+| `reset_every_n_steps` | `100` | 每 N 步重置 inference_state |
+| `remote_port` | `null` | 非空时启用 WebSocket 远程模式 |
+
+### 2.2 SAM2 Runtime 初始化
 
 ```python
-{
-    "enabled":               True,
-    "cfg":                   sam2_cfg,        # edict
-    "device":                torch.device,
-    "predictor":             SAM2VideoPredictor,
-    "inference_state":       None,            # 冷启动后设置
-    "frame_idx":             0,               # 当前帧在 inference_state buffer 中的索引
-    "last_arm_mask_raw":     None,            # bool (H, W)，未膨胀
-    "last_gripper_mask_raw": None,            # bool (H, W)，未膨胀
-    "last_reset_frame_idx":  0,               # 上次重置时的 frame_idx
-    "last_fail_reason":      None,            # 最近一次失败原因（字符串）
+if config.mask_aware.enabled and args.type == "local" and config.mask_aware.sam2.enabled:
+    _sam2_runtime = _init_sam2_runtime(config.mask_aware.sam2)
+```
+
+**本地模式**（`remote_port=null`）：加载 `SAM2VideoPredictor` 模型，创建 runtime dict：
+
+```python
+_sam2_runtime = {
+    "enabled": True,
+    "cfg": sam2_cfg,
+    "device": torch.device("cuda"),
+    "predictor": SAM2VideoPredictor,   # 微调后的模型
+    "inference_state": None,           # 首帧标注后才创建
+    "frame_idx": 0,                    # 当前 buffer 中的帧索引
+    "last_arm_mask_raw": None,         # 上一帧 arm mask（未膨胀），用于 reset 时提示
+    "last_gripper_mask_raw": None,     # 上一帧 gripper mask（未膨胀）
+    "last_reset_frame_idx": 0,         # 上次重置时的 frame_idx
+    "last_fail_reason": None,          # 最近一次失败原因
+    "last_frame_np": None,             # 上一帧 RGB 图像（用于重置时序对齐）
 }
 ```
 
-### 为何使用 VideoPredictor 而非 ImagePredictor
-
-`SAM2VideoPredictor` 内置跨帧时序 memory，与微调训练分布一致，跟踪稳定性优于无状态的 `SAM2ImagePredictor`。
-标准 `init_state(video_path)` 需要全量帧预加载，不适合在线部署，故手动构建 `inference_state`（见第 6 节）。
-
----
-
-## 5. Rollout 主循环
+**远程模式**（`remote_port=8765`）：不加载模型，只建立 WebSocket 连接：
 
 ```python
-with torch.inference_mode():
-    for t in range(config.deploy.max_steps):
-        if t % config.deploy.num_inference_steps == 0:
-            # 每 num_inference_steps 步进行一次完整策略推理
-            ...
-        # 每步均从 ensemble buffer 取动作并执行
-        step_action = ensemble_buffer.get_action()
-        agent.action(step_action, rotation_rep="rotation_6d")
+_sam2_runtime = {
+    "mode": "remote",
+    "enabled": True,
+    "conn": <WebSocket connection>,
+    "packer": msgpack_numpy.Packer(),
+    "last_fail_reason": None,
+}
 ```
-
-**num_inference_steps 的意义**：策略以较低频率（例如每 5 步）推理一次，输出一段动作序列，ensemble buffer 在更高频率下逐步取出执行。这减少了计算压力，同时通过 ensemble 平滑动作抖动。
 
 ---
 
-## 6. SAM2 分割流程详解
+## 3. Rollout 主循环结构
 
-分割入口为 `_safe_infer_mask`，内部调用 `infer_mask`，捕获所有异常并转化为 `None`（触发 no_mask_fallback）。
+```
+t=0,1,2,...,max_steps-1（默认 3000 步）
+      │
+      ├─ ① 采观测（每步）
+      │     colors_raw, depths = agent.get_global_observation()
+      │     colors_raw: uint8 (H,W,3) RGB
+      │     depths:     uint16 (H,W)  毫米深度
+      │
+      ├─ ② SAM2 推理（每步）
+      │     mask01 = _safe_infer_mask(color, depth, ...)
+      │     mask01: float32 (H,W)，1.0=机械臂像素，0.0=其余
+      │
+      ├─ ③ Policy 推理（仅 t % num_inference_steps == 0）
+      │     3D: depths_for_cloud[mask01 > 0.5] = 0
+      │     点云构建 → MinkowskiEngine SparseTensor
+      │     2D: image_mask_weight = 1 - pool(mask01)
+      │     policy(cloud, image, image_coords, image_mask_weight)
+      │     → pred_raw_action (H, action_dim)
+      │     EnsembleBuffer.add_action(action, t)
+      │
+      └─ ④ 执行动作（每步）
+            step_action = EnsembleBuffer.get_action()
+            agent.action(step_action)
+```
 
-### 6.1 冷启动：首帧交互标注
+**观测频率 vs 推理频率**：
 
-**触发条件**：`_sam2_runtime["inference_state"] is None`（第一次调用 `infer_mask`）
+- `num_inference_steps=20`，`max_steps=3000` → 共 150 次 policy 推理
+- 每次 policy 推理输出长度 `H=20` 的动作序列
+- 两次 policy 推理之间，机器人按 buffer 里的动作开环执行，同时 SAM2 持续每步追帧
+- SAM2 的连续追帧保证了 policy 推理时拿到的 mask 始终是当步的最新结果
 
-**步骤**：
+---
 
-1. `_build_video_inference_state_from_np(predictor, color_np)`
-   - 对当前帧 resize 到 `predictor.image_size`（通常 1024）
-   - ImageNet 均值方差归一化 → `(1, 3, H, W)` float32 tensor，放入 GPU
-   - 手动构建 `inference_state` dict（替代 `init_state(video_path)`），包含：
-     - `images`：单帧张量
-     - `num_frames`：1
-     - `video_height / video_width`：原始分辨率
-     - 空的 `point_inputs_per_obj`、`mask_inputs_per_obj`、`cached_features` 等
-   - 调用 `predictor._get_image_feature(inference_state, frame_idx=0, batch_size=1)` 预热视觉骨干并缓存帧 0 特征
+## 4. SAM2 推理详解
 
-2. `_cold_start_interactive(predictor, inference_state, cfg, color_np)`
-   弹出 cv2 窗口，显示当前帧，等待用户交互标注：
+入口函数：`infer_mask(color, depth, proprio, meta, agent=None)`
 
-   | 操作 | 含义 |
-   |------|------|
-   | `[a]` | 切换到 ARM 模式（obj_id = arm_obj_id，默认 1） |
-   | `[g]` | 切换到 GRIPPER 模式（obj_id = gripper_obj_id，默认 2） |
-   | 左键点击 | 添加正样本点（前景） |
-   | 右键点击 | 添加负样本点（背景） |
-   | `[r]` | 清空当前对象的所有标注点 |
-   | Enter / Space | 确认标注，关闭窗口继续推理 |
-   | ESC | 中止冷启动，本帧返回 None |
+返回：`np.ndarray (H,W) uint8`（255=机械臂区域，0=其余），失败返回 `None`。
 
-   每次点击后实时调用 `predictor.add_new_points_or_box`（`normalize_coords=True`，坐标为图像像素坐标）并刷新 mask 叠加显示。
-   标注完成后返回 `(arm_raw: bool HW, gripper_raw: bool HW)`。
+### 4.1 冷启动：首帧交互标注
 
-3. 将 `inference_state`、`frame_idx=0`、`last_arm_mask_raw`、`last_gripper_mask_raw` 存入 `_sam2_runtime`
-4. 立即计算并返回首帧 final mask（`_compute_final_mask`）
+**触发条件**：`_sam2_runtime["inference_state"] is None`，即首次调用。
 
-### 6.2 后续帧：在线流式推理
+**流程**：
 
-**正常路径**（非重置帧）：
+```
+1. _build_video_inference_state_from_np(predictor, color_np)
+   │  手动构建 inference_state dict（复现 SAM2VideoPredictor.init_state() 逻辑）
+   │  fields: images(1帧张量), num_frames=1, video_height/width,
+   │          point_inputs_per_obj, mask_inputs_per_obj,
+   │          cached_features, obj_id_to_idx, output_dict_per_obj, ...
+   └→ predictor._get_image_feature(state, frame_idx=0, batch_size=1)
+      预热视觉特征缓存
 
-1. `_append_frame_to_video_state(predictor, inference_state, color_np)`
-   - 预处理新帧 → `(1, 3, H, W)` tensor
-   - `torch.cat` 拼接到 `inference_state["images"]`（buffer 逐帧增长）
-   - `inference_state["num_frames"] += 1`
-   - `frame_idx += 1`
+2. _cold_start_interactive(predictor, inference_state, cfg, color_np)
+   │  弹出 cv2 窗口，显示当前帧
+   │  用户操作：
+   │    [a] 切换到 ARM 模式（obj_id=1）
+   │    [g] 切换到 GRIPPER 模式（obj_id=2）
+   │    左键 = 正点（前景），右键 = 负点（背景）
+   │    [r] 清空当前对象的所有点
+   │    Enter/Space = 确认，关闭窗口
+   │    ESC = 中止
+   │  每次点击后实时调用：
+   │    predictor.add_new_points_or_box(
+   │        inference_state, frame_idx=0, obj_id=oid,
+   │        points=pts_np, labels=lbs_np, normalize_coords=True
+   │    )
+   │  实时渲染 mask 叠加预览（arm=蓝色，gripper=橙色）
+   └→ 返回 (arm_raw_bool, gripper_raw_bool)
 
-2. `predictor.propagate_in_video(inference_state, start_frame_idx=frame_idx, max_frame_num_to_track=1)`
-   - 内部使用跨帧时序 memory 对第 `frame_idx` 帧进行跟踪推理
-   - 返回 `(frame_idx, obj_ids, mask_logits)`
-   - `mask_logits[i].squeeze() > 0.0` → bool mask
-   - 按 obj_id 分配到 `arm_raw` / `gripper_raw`
+3. 存入 runtime：
+   _sam2_runtime["inference_state"]       = state
+   _sam2_runtime["frame_idx"]             = 0
+   _sam2_runtime["last_arm_mask_raw"]     = arm_raw
+   _sam2_runtime["last_gripper_mask_raw"] = gripper_raw
+   _sam2_runtime["last_frame_np"]         = color_np.copy()
 
-3. 更新 `_sam2_runtime["last_arm_mask_raw"]` 和 `last_gripper_mask_raw`（存储未膨胀 raw mask，供下次跟踪使用）
+4. 返回 _compute_final_mask(arm_raw, gripper_raw, dilate_radius) * 255
+```
 
-4. 返回 `_compute_final_mask(arm_raw, gripper_raw, dilate_radius) * 255`
+### 4.2 后续帧：流式追帧 + propagate
 
-### 6.3 周期重置机制
+每步（非 reset 步）：
 
-**触发条件**：`(frame_idx - last_reset_frame_idx) >= reset_every_n_steps` 且上一帧 arm_raw 有效
+```
+1. _append_frame_to_video_state(predictor, inference_state, color_np)
+   │  将当前帧预处理（resize → img_size，归一化 ImageNet mean/std）
+   │  inference_state["images"] = torch.cat([旧buffer, 新帧], dim=0)
+   │  inference_state["num_frames"] += 1
+   └→ frame_idx += 1
 
-**目的**：`images` buffer 随时间无限增长会耗尽显存。每 N 步将 buffer 缩减为单帧，利用上一帧的 raw mask 重新锚定跟踪。
+2. predictor.propagate_in_video(
+       inference_state,
+       start_frame_idx=frame_idx,
+       max_frame_num_to_track=1      ← 只处理当前这一帧
+   )
+   │  for _, obj_ids, mask_logits in ...:
+   │      arm_raw     = mask_logits[arm_idx].squeeze().cpu().numpy() > 0
+   │      gripper_raw = mask_logits[grp_idx].squeeze().cpu().numpy() > 0
+   └→ 利用 SAM2 时序 memory（conditioning frames 的视觉特征）定位当前帧对象
 
-**步骤**：
+3. 更新 runtime：
+   last_arm_mask_raw     = arm_raw
+   last_gripper_mask_raw = gripper_raw
+   last_frame_np         = color_np.copy()
 
-1. 从当前帧重建 `inference_state`（仅含 1 帧）
-2. `predictor.add_new_mask(inference_state, frame_idx=0, obj_id=arm_obj_id, mask=arm_raw_prev)` → 以上一帧 mask 作为 prompt
-3. 若 gripper_raw_prev 不为 None，同样 add_new_mask for gripper
-4. 重置 `frame_idx = 0`，`last_reset_frame_idx = 0`
+4. 返回 _compute_final_mask(arm_raw, gripper_raw, dilate_radius) * 255
+```
 
-重置后继续正常调用 `propagate_in_video`，跟踪状态从当前帧重新建立。
+**为何每步追帧而不是只在推理步时运行**：
 
-> **注意**：`predictor.reset_state` 不清除 `cached_features`，因此视觉骨干特征缓存在重置后仍然有效。
+SAM2VideoPredictor 的时序 memory 依赖连续帧输入。若跳帧（如每 20 步才喂一帧），相邻两帧之间机械臂可能已移动大段距离，time-step gap 超出模型训练分布，导致跟踪漂移或丢失。**每步都追帧确保 SAM2 看到的视频序列与真实控制频率一致**。
 
-### 6.4 最终 mask 合成
+### 4.3 周期重置：显存管理
+
+**触发条件**：
+
+```python
+need_reset = (
+    cfg.reset_every_n_steps > 0
+    and (frame_idx - last_reset_frame_idx) >= cfg.reset_every_n_steps
+    and arm_raw_prev is not None
+)
+```
+
+默认每 100 步触发一次。随着 `inference_state["images"]` 不断追帧，buffer 线性增长（每帧约 `3 × img_size² × 4 bytes`），100 帧后积累数百 MB VRAM，需要定期清理。
+
+**重置逻辑（时序对齐版本）**：
+
+```
+问题根因：
+  若用"当前帧（t）图像 + 上一帧（t-1）mask"作为 conditioning，
+  SAM2 对 conditioning frame 直接返回输入 mask（不做视觉校正），
+  导致 reset 帧输出的是 t-1 位置的 mask，与当前帧图像无关。
+
+正确实现：
+
+  step 1. src = last_frame_np              ← 上一帧（t-1）的图像
+           state = _build_video_inference_state_from_np(predictor, src)
+           add_new_mask(state, frame_idx=0, mask=arm_raw_prev)   ← t-1 mask
+           → conditioning frame: t-1 图像 + t-1 mask（严格对齐）
+
+  step 2. _append_frame_to_video_state(predictor, state, color_np)
+           → 追加当前帧（t）作为 frame_idx=1
+
+  step 3. propagate(start_frame_idx=1, max_frame_num_to_track=1)
+           → SAM2 从 t-1 正常传播到 t，利用视觉特征做跨帧跟踪
+
+  step 4. frame_idx = 1, last_reset_frame_idx = 1
+           → 下次触发重置的计数从 1 开始累积
+```
+
+**重置后效果**：buffer 从 100 帧缩减为 2 帧，VRAM 立即释放，跟踪不中断。
+
+### 4.4 Mask 合成：arm 膨胀减去 gripper
 
 ```python
 def _compute_final_mask(arm_raw, gripper_raw, dilate_radius):
     arm_dilated = _dilate_mask_bool(arm_raw, dilate_radius)
     if gripper_raw is not None:
         grp_dilated = _dilate_mask_bool(gripper_raw, dilate_radius)
-        return np.logical_and(arm_dilated, np.logical_not(grp_dilated))
+        return arm_dilated AND NOT grp_dilated
     return arm_dilated
 ```
 
-- **arm_raw** 和 **gripper_raw** 为 raw（未膨胀）bool mask，存入 runtime 供下帧跟踪
-- 最终 mask = `dilate(arm_raw)  AND  NOT dilate(gripper_raw)`
-- 膨胀使用正方形 kernel，边长 = `2 * dilate_radius + 1`
-- 结果转为 `uint8 * 255`：机械臂区域（去除 gripper 后）= 255，其余 = 0
+**设计理由**：
 
-**设计意图**：
-
-| 区域 | 最终 mask 值 | 含义 |
-|------|-------------|------|
-| arm 膨胀区域（去除 gripper 部分） | 255 | 不可信区域，屏蔽 |
-| gripper 膨胀区域 | 0 | 保留（gripper 操作区为有效观测） |
-| 背景 | 0 | 保留 |
-
-arm 和 gripper 共用同一 `dilate_radius`，通过 Boolean 差集分离两者。
+- `arm_raw` / `gripper_raw` 是 SAM2 输出的**原始未处理 mask**，存入 runtime 供下帧跟踪使用（不膨胀存储，保证 SAM2 下帧看到的是真实对象边界）
+- 膨胀在合成阶段做，扩大机械臂遮挡区域边界，防止关节边缘点云噪声进入场景点云
+- gripper 区域从 arm 中减去：gripper 末端可能接触目标物体，该区域点云有用，应当**保留**而不是过滤
 
 ---
 
-## 7. Mask 规范化与下游使用
+## 5. Mask 在下游的两个用途
 
-`_safe_infer_mask` 调用 `_normalize_mask01(raw_mask, depth.shape[:2], mask_cfg)`：
+`mask01`：float32 (H,W)，**1.0 = 机械臂像素（不可信区域），0.0 = 场景**
 
-1. 统一转为 numpy（支持 Tensor / ndarray 输入）
-2. 处理多余维度（单通道 `(1, H, W)` 或 `(H, W, 1)`）
-3. 若 mask 分辨率与深度图不匹配 → `cv2.INTER_NEAREST` 最近邻 resize
-4. 二值化：
-   - `mask_white_is_untrusted=True`（默认）：`mask01 = (mask_np > threshold).astype(float32)`
-   - `mask01 = 1.0` 表示不可信（机械臂区域），`mask01 = 0.0` 表示可信
-
-返回：`mask01 (H, W) float32`，值域 `{0.0, 1.0}`
-
----
-
-## 8. 3D 点云过滤分支
+### 5.1 3D 点云过滤
 
 ```python
+# 仅在推理步执行
 if mask_enabled and config.mask_aware.enable_3d_filter and mask01 is not None:
     depths_for_cloud = depths.copy()
-    depths_for_cloud[mask01 > 0.5] = 0   # 机械臂区域深度置零
+    depths_for_cloud[mask01 > 0.5] = 0   # 机械臂像素深度置0
 ```
 
-将机械臂区域的深度值归零，使后续点云重建时该区域不产生点，避免机械臂遮挡影响场景理解。
+`create_input(colors_raw, depths_for_cloud, ...)` 将深度图转为 3D 点云：
 
-**点云构建流程**（`create_input` → `create_point_cloud`）：
+1. 利用相机内参将每个有效深度像素反投影为 3D 点
+2. 深度为 0 的像素不会生成点 → 机械臂像素被过滤
+3. 裁剪到 workspace bbox，体素下采样
+4. 输出的点云**只含场景物体**，不含机械臂自身
 
-1. （可选）rescale depths & colors
-2. `o3d.geometry.RGBDImage.create_from_color_and_depth` → RGBD 图像
-3. `PointCloud.create_from_rgbd_image(rgbd, intrinsics)` → 稠密点云
-4. `cloud.crop(bbox3d)` → 按 workspace 裁剪（`config.deploy.workspace.min/max`）
-5. `cloud.voxel_down_sample(config.data.voxel_size)` → 体素降采样
+若过滤后点云为空（机械臂完全遮挡场景），回退到未过滤的原始深度重建点云，并计入 `empty_cloud_skip` 统计。
 
-**空点云回退**：
-
-- 若过滤后点云为空 → `warn_and_skip_filter`（用原始深度重建）或 `fail_fast`
-- 若点云存在非法数值（NaN/Inf）→ 用原始深度重建，记录 `points_nonfinite`
-
----
-
-## 9. 2D 图像 patch 重权分支
+### 5.2 2D 图像 Patch 权重重加权
 
 ```python
-image_mask_weight = _build_image_mask_weight(mask01, image_processor)
+# 仅在推理步执行
+if mask_enabled and config.mask_aware.enable_2d_reweight and mask01 is not None:
+    image_mask_weight = _build_image_mask_weight(mask01, image_processor)
 ```
-
-1. `mask01` → `(1, H, W)` tensor
-2. resize 到 image_processor.img_size（同图像 encoder 输入分辨率）
-3. `image_processor.image_coord_pooling(mask_tensor)` → 每个 image patch 内 mask 的平均比例（`mask_ratio`）
-4. `image_mask_weight = (1.0 - mask_ratio).clamp(0, 1)` → patch 可信度权重
-   - 机械臂比例越高的 patch，权重越低（趋近 0）
-   - 无机械臂的 patch，权重 = 1.0
-
-该权重作为 `image_mask_weight` 传入 `policy(...)` 的 attention 模块，降低机械臂遮挡区域对策略的影响。
-
-**异常处理**：构建失败或出现非有限数值时，权重置 None（降级为不加权），记录 `reweight_fallback` / `weight_nonfinite`。
-
----
-
-## 10. 策略推理与动作预测
 
 ```python
-pred_raw_action = policy(
-    cloud_data,          # MinkowskiEngine SparseTensor
-    colors,              # (1, C, H, W) 预处理图像
-    image_coords,        # (1, N_pts, 2) 点云到图像的投影坐标
-    image_mask_weight,   # (1, N_patch) 或 None
-    actions=None,
-).squeeze(0).cpu().numpy()
+def _build_image_mask_weight(mask01, image_processor):
+    mask_tensor = resize_image(mask01, image_processor.img_size, NEAREST)
+    mask_ratio  = image_processor.image_coord_pooling(mask_tensor)
+    # mask_ratio: 每个 patch 内机械臂像素的占比 ∈ [0,1]
+    image_mask_weight = (1.0 - mask_ratio).clamp(0.0, 1.0)
+    # 机械臂占比越高 → 权重越低（接近0）
 ```
 
-- `cloud_data`：3D 点云的稀疏张量（MinkowskiEngine 格式），`coords` 为体素坐标，`feats` 为 XYZ 坐标
-- 输出 `pred_raw_action`：归一化动作序列，形状 `(num_action, action_dim)`
-
-### 动作维度
-
-| 机器人类型 | action_dim | 含义 |
-|-----------|-----------|------|
-| single    | 10        | [trans(3), rot6d(6), gripper(1)] |
-| dual      | 20        | left: [trans(3), rot6d(6), gripper(1)], right: [trans(3), rot6d(6), gripper(1)] |
-
-`process_state(..., to_control=True)` 将归一化动作反归一化：
-- translation: `[-1, 1]` → `[trans_min, trans_max]`（米）
-- gripper: `[-1, 1]` → `[0, max_gripper_width]`（米）
-- rotation 6d 保持不变（投影器负责后续换算）
-
----
-
-## 11. 动作投影与 Ensemble
-
-### 坐标投影
+传入 policy：
 
 ```python
-# 单臂
-action_tcp = projector.project_tcp_to_base_coord(action[..., :9], rotation_rep="rotation_6d")
-action = np.concatenate([action_tcp, action[..., 9:10]], axis=-1)
-
-# 双臂
-action_left_tcp  = projector.project_tcp_to_base_coord(action[..., :9],   "left",  rotation_rep="rotation_6d")
-action_right_tcp = projector.project_tcp_to_base_coord(action[..., 10:19], "right", rotation_rep="rotation_6d")
-action = np.concatenate([action_left_tcp, action[..., 9:10], action_right_tcp, action[..., 19:20]], axis=-1)
+policy(cloud_data, colors_proc, image_coords, image_mask_weight=image_mask_weight)
 ```
 
-将相机系 TCP 动作投影到机器人基坐标系（使用 rise2 extrinsics 标定）。
-
-### Ensemble Buffer
-
-- `ensemble_buffer.add_action(action, t)` 每次策略推理后将整段动作序列加入 buffer
-- `ensemble_buffer.get_action()` 每步（含策略未推理的步）取出当前时刻的加权平均动作
-- ensemble_mode 由配置决定（时序加权平均）
-- 若 buffer 为空（首步前）返回 None → 跳过该步执行
+policy 的图像编码器（DINOv2）对每个 patch 的注意力乘以该权重。机械臂遮挡的 patch 权重接近 0，policy 在视觉上"忽略"机械臂区域，更专注于目标物体的外观特征。
 
 ---
 
-## 12. 回退逻辑与异常统计
+## 6. 异常处理与回退机制
 
-### 回退层次
+所有 SAM2 调用通过 `_safe_infer_mask` 包装：
 
+```python
+def _safe_infer_mask(color, depth, proprio, meta, mask_cfg, agent=None):
+    try:
+        raw_mask = infer_mask(color, depth, proprio, meta, agent=agent)
+    except Exception:
+        return None, "infer_exception", None
+    if raw_mask is None:
+        return None, "infer_none", None
+    try:
+        mask01 = _normalize_mask01(raw_mask, depth.shape[:2], mask_cfg)
+    except Exception:
+        return None, "mask_invalid", raw_mask
+    return mask01, None, raw_mask
 ```
-infer_mask 返回 None
-  └─ _safe_infer_mask → mask01=None, mask_reason=...
-       └─ infer_none_policy
-           ├─ "no_mask_fallback"：记录日志，继续（跳过 3D 过滤和 2D reweight）
-           └─ "fail_fast"：抛出 RuntimeError，终止 rollout
-```
 
-### 统计指标（rollout 结束后打印）
+`mask01 is None` 时的处理策略：
 
-| 统计项 | 含义 |
-|--------|------|
-| `infer_none` | `infer_mask` 正常返回 None |
-| `infer_exception` | `infer_mask` 抛出异常 |
-| `mask_invalid` | `_normalize_mask01` 失败（mask 格式异常） |
-| `empty_cloud_skip` | 3D 过滤后点云为空，回退原始深度 |
-| `reweight_fallback` | 2D 权重构建失败 |
-| `points_nonfinite` | 点云含 NaN/Inf，回退原始深度 |
-| `weight_nonfinite` | 2D 权重含 NaN/Inf |
-| `sam2_propagate_fail` | `propagate_in_video` 异常或 arm mask 为 None |
-| `sam2_invalid_color` | 输入颜色图格式错误（非 uint8 HWC-3） |
+| 情况 | `infer_none_policy` | 行为 |
+|------|---------------------|------|
+| 非推理步 mask 失败 | 任意 | 仅统计，不影响 policy（该步本就不推理） |
+| 推理步 mask 失败 | `no_mask_fallback` | 打印日志，本次推理不用 mask（无 3D 过滤，无 2D 权重） |
+| 推理步 mask 失败 | `fail_fast` | 抛出异常，终止 rollout |
 
-### SAM2 内部失败原因（`_sam2_runtime["last_fail_reason"]`）
+**`infer_mask` 内部失败类型**：
 
-| 值 | 含义 |
-|----|------|
-| `sam2_invalid_color` | 颜色图格式不符 |
-| `sam2_cold_start_exception` | 冷启动初始化抛出异常 |
+| `last_fail_reason` | 原因 |
+|--------------------|------|
+| `sam2_invalid_color` | 输入 color 不是 3 通道 uint8 |
+| `sam2_cold_start_exception` | 构建初始 state 或打开 cv2 窗口时抛异常 |
 | `sam2_cold_start_aborted` | 用户按 ESC 中止标注 |
-| `sam2_reset_exception` | 周期重置时抛出异常 |
-| `sam2_append_exception` | 追加新帧时抛出异常 |
-| `sam2_propagate_fail` | propagate 异常或未返回 arm mask |
+| `sam2_reset_exception` | 周期重置时重建 state 失败 |
+| `sam2_append_exception` | 追帧时失败 |
+| `sam2_propagate_fail` | `propagate_in_video` 抛异常或返回空 obj_ids |
+| `sam2_remote_exception` | WebSocket 通信失败（远程模式） |
 
 ---
 
-## 13. 配置参考
+## 7. 跨 Conda 环境部署：WebSocket 服务模式
 
-### 最小可用配置（YAML 节选）
+`rise2` 环境与 `sam2` 环境存在依赖冲突，无法在同一进程中加载。解决方案：将 SAM2 单独作为 WebSocket 服务运行，复用项目已有的 `remote_eval/msgpack_numpy.py` 序列化层。
+
+### 通信协议
+
+```
+rise2 进程  →  sam2 进程:
+    msgpack({"color": np.ndarray uint8 HWC})
+
+sam2 进程   →  rise2 进程:
+    msgpack({"mask": np.ndarray uint8 HW | None,
+             "reason": str | None})
+```
+
+- 只传 RGB 图像，不传 depth（深度处理留在 rise2 侧）
+- 冷启动 cv2 窗口在 **sam2 进程**弹出，用户标注完毕后才返回第一帧 mask
+- 客户端在 `conn.recv()` 处阻塞等待，rollout 暂停直到标注完成
+
+### 启动方式
+
+```bash
+# 终端1：sam2 环境启动服务
+conda run -n sam2 python sam2/sam2_mask_server.py \
+    --config configs/dual_teleop_dino.yaml --port 8765
+# 等待打印：[sam2-server] listening on 127.0.0.1:8765
+
+# 终端2：rise2 环境启动 eval
+conda activate rise2
+python sam2/eval_mask_final.py --config configs/dual_teleop_dino.yaml ...
+# 打印：[mask-aware/sam2] connected to remote server at ws://127.0.0.1:8765
+```
+
+YAML 激活（加一行即可）：
+
+```yaml
+mask_aware:
+  sam2:
+    enabled: true
+    remote_port: 8765   # 加这行 → remote 模式；不加 → local 模式
+```
+
+---
+
+## 8. 完整时间线示例
+
+配置：`num_inference_steps=20`，`max_steps=3000`，`reset_every_n_steps=100`
+
+```
+t=0  ← 第一步
+  ① 采观测 (colors_raw, depths)
+  ② SAM2: inference_state is None → 冷启动
+          弹出 cv2 窗口，用户标注 arm + gripper
+          建 inference_state（1帧），frame_idx=0
+          返回 mask01（来自冷启动标点）
+  ③ t%20==0 → policy 推理：
+          3D 过滤: depths[mask01>0.5]=0 → 点云（无机械臂）
+          2D 权重: image_mask_weight = 1 - pool(mask01)
+          policy → 动作序列 (20, action_dim)
+          EnsembleBuffer.add_action(action, t=0)
+  ④ buffer 取动作 → agent.action()
+
+t=1..19  ← 非推理步
+  ① 采观测
+  ② SAM2: 追帧 → propagate(frame_idx=1..19) → mask01 更新（持续追踪）
+  ③ 跳过（非推理步）
+  ④ buffer 取动作 → agent.action()
+
+t=20  ← 第二次 policy 推理
+  ① 采观测
+  ② SAM2: 追帧 → propagate(frame_idx=20) → mask01（已积累20帧时序信息）
+  ③ t%20==0 → policy 推理（用 t=20 的 mask01，此时跟踪已稳定）
+  ④ buffer 取动作
+
+...
+
+t=100  ← 周期重置（frame_idx=100，满足 100-0 >= 100）
+  ① 采观测（color_np = t=100 的图像）
+  ② SAM2: need_reset=True
+          用 last_frame_np（t=99 图像）+ arm_raw_prev（t=99 mask）
+          建新 state（conditioning frame = t=99，图像与 mask 严格对齐）
+          追加 color_np（t=100）作为 frame_idx=1
+          propagate(start=1) → t=99→t=100 正常视觉传播
+          frame_idx=1，last_reset_frame_idx=1
+          buffer 从100帧缩减为2帧，VRAM 释放
+  ③/④ 正常继续
+
+t=3000  ← rollout 结束
+  打印统计：
+  [mask-aware] summary infer_none=X infer_exception=X mask_invalid=X
+               empty_cloud_skip=X reweight_fallback=X points_nonfinite=X
+               weight_nonfinite=X sam2_propagate_fail=X sam2_invalid_color=X
+```
+
+---
+
+## 9. 配置参数参考
 
 ```yaml
 mask_aware:
   enabled: true
-  enable_3d_filter: true
-  enable_2d_reweight: true
-  mask_threshold: 0
-  mask_white_is_untrusted: true
-  infer_none_policy: no_mask_fallback
+  enable_3d_filter: true           # 点云过滤开关
+  enable_2d_reweight: true         # 图像权重重加权开关
+  mask_threshold: 0                # mask 二值化阈值
+  mask_white_is_untrusted: true    # true: mask>threshold 为机械臂（不可信）
+  infer_none_policy: no_mask_fallback  # mask 推理失败时的策略
   empty_cloud_policy: warn_and_skip_filter
 
   sam2:
     enabled: true
     config_file: configs/sam2.1/sam2.1_hiera_b+.yaml
-    ckpt_path: checkpoints/sam2.1_hiera_base_plus.pt  # 微调权重
-    device: cuda_if_available
+    ckpt_path: checkpoints/sam2.1_hiera_base_plus.pt
+    device: cuda
     arm_obj_id: 1
     gripper_obj_id: 2
     dilate_radius: 10
-    reset_every_n_steps: 30
+    reset_every_n_steps: 100
+    # remote_port: 8765   # 跨环境部署时取消注释
 ```
 
-### 典型参数调优建议
-
-| 参数 | 较小值效果 | 较大值效果 |
-|------|-----------|-----------|
-| `dilate_radius` | 更精确边界，可能遗漏部分臂区域 | 更保守屏蔽，可能误删有效点 |
-| `reset_every_n_steps` | 显存占用更低，跟踪连续性稍弱 | 跟踪更连续，显存随时间增长 |
-
 ---
 
-## 14. 关键数据类型速查
+## 10. 统计计数器说明
 
-| 变量 | 形状 | dtype | 说明 |
-|------|------|-------|------|
-| `colors` | `(H, W, 3)` | uint8 | RGB 颜色图，来自 agent |
-| `depths` | `(H, W)` | uint16 | 深度图（单位：毫米） |
-| `arm_raw` / `gripper_raw` | `(H, W)` | bool | SAM2 raw mask，未膨胀，存于 runtime |
-| `final` | `(H, W)` | bool | `dilate(arm) AND NOT dilate(gripper)` |
-| `raw_mask` | `(H, W)` | uint8 | `final * 255`，`infer_mask` 返回值 |
-| `mask01` | `(H, W)` | float32 | 规范化后，1.0=不可信，0.0=可信 |
-| `image_mask_weight` | `(1, N_patch)` | float32 | patch 可信度权重 |
-| `coords` | `(N, 4)` | int32 | MinkowskiEngine 体素坐标（含 batch dim） |
-| `points` | `(N, 3)` | float32 | 点云 XYZ（米） |
-| `pred_raw_action` | `(num_action, action_dim)` | float32 | 归一化动作序列 |
-| `inference_state["images"]` | `(T, 3, img_size, img_size)` | float32 | SAM2 帧 buffer，逐帧追加 |
-
----
-
-*本文档由 Claude Code 根据 `sam2/eval_mask_final.py` 源码自动生成。*
+| 字段 | 含义 | 正常期望 |
+|------|------|----------|
+| `infer_none` | `infer_mask` 返回 None（已知失败） | 接近 0 |
+| `infer_exception` | `infer_mask` 抛出未预期异常 | 0 |
+| `mask_invalid` | mask 格式/尺寸异常，`_normalize_mask01` 失败 | 0 |
+| `empty_cloud_skip` | 3D 过滤后点云为空，回退到原始深度 | 偶发可接受 |
+| `reweight_fallback` | 2D 权重构建失败，本次不使用 2D 权重 | 0 |
+| `points_nonfinite` | 点云中出现 NaN/Inf，回退到原始深度 | 0 |
+| `weight_nonfinite` | 2D 权重中出现 NaN/Inf，丢弃权重 | 0 |
+| `sam2_propagate_fail` | `propagate_in_video` 失败或未返回 arm mask | 接近 0 |
+| `sam2_invalid_color` | 输入 color 图像格式不合法 | 0 |
