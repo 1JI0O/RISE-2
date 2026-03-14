@@ -1,6 +1,6 @@
 # SAM2 在 Eval 流程中的完整工作流程
 
-> 文件：`sam2/eval_mask_final.py`，服务端：`sam2/sam2_mask_server.py`
+> 文件：`eval_sam2_mask_final.py`，服务端：`sam2_mask_server.py`
 > 最后更新：2026-03
 
 ---
@@ -409,13 +409,13 @@ sam2 进程   →  rise2 进程:
 
 ```bash
 # 终端1：sam2 环境启动服务
-conda run -n sam2 python sam2/sam2_mask_server.py \
+conda run -n sam2 python sam2_mask_server.py \
     --config configs/dual_teleop_dino.yaml --port 8765
 # 等待打印：[sam2-server] listening on 127.0.0.1:8765
 
 # 终端2：rise2 环境启动 eval
 conda activate rise2
-python sam2/eval_mask_final.py --config configs/dual_teleop_dino.yaml ...
+python eval_sam2_mask_final.py --config configs/dual_teleop_dino.yaml ...
 # 打印：[mask-aware/sam2] connected to remote server at ws://127.0.0.1:8765
 ```
 

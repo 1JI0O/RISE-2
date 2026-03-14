@@ -615,9 +615,8 @@ def infer_mask(color, depth, proprio, meta, agent=None):
         _sam2_runtime["last_fail_reason"] = "sam2_propagate_fail"
         return None
 
-    _sam2_runtime["last_arm_mask_raw"] = arm_raw
-    if gripper_raw is not None:
-        _sam2_runtime["last_gripper_mask_raw"] = gripper_raw
+    _sam2_runtime["last_arm_mask_raw"]     = arm_raw
+    _sam2_runtime["last_gripper_mask_raw"] = gripper_raw   # 显式覆写：无检测时置 None，避免 stale mask 穿越 reset
     _sam2_runtime["last_frame_np"] = color_np.copy()
 
     final = _compute_final_mask(arm_raw, gripper_raw, cfg.dilate_radius)
@@ -961,6 +960,11 @@ def evaluate(args_override):
         "weight_nonfinite": 0,
         "sam2_propagate_fail": 0,
         "sam2_invalid_color": 0,
+        "sam2_reset_exception": 0,
+        "sam2_append_exception": 0,
+        "sam2_remote_exception": 0,
+        "sam2_cold_start_exception": 0,
+        "sam2_cold_start_aborted": 0,
     }
 
     # evaluation rollout
@@ -1148,7 +1152,9 @@ def evaluate(args_override):
     print(
         "[mask-aware] summary infer_none={} infer_exception={} mask_invalid={} "
         "empty_cloud_skip={} reweight_fallback={} points_nonfinite={} weight_nonfinite={} "
-        "sam2_propagate_fail={} sam2_invalid_color={}".format(
+        "sam2_propagate_fail={} sam2_invalid_color={} "
+        "sam2_reset_exception={} sam2_append_exception={} sam2_remote_exception={} "
+        "sam2_cold_start_exception={} sam2_cold_start_aborted={}".format(
             mask_stats["infer_none"],
             mask_stats["infer_exception"],
             mask_stats["mask_invalid"],
@@ -1158,6 +1164,11 @@ def evaluate(args_override):
             mask_stats["weight_nonfinite"],
             mask_stats["sam2_propagate_fail"],
             mask_stats["sam2_invalid_color"],
+            mask_stats["sam2_reset_exception"],
+            mask_stats["sam2_append_exception"],
+            mask_stats["sam2_remote_exception"],
+            mask_stats["sam2_cold_start_exception"],
+            mask_stats["sam2_cold_start_aborted"],
         )
     )
 

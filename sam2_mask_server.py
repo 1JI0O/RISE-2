@@ -373,9 +373,8 @@ class SAM2MaskServer:
             rt["last_fail_reason"] = "sam2_propagate_fail"
             return None
 
-        rt["last_arm_mask_raw"] = arm_raw
-        if gripper_raw is not None:
-            rt["last_gripper_mask_raw"] = gripper_raw
+        rt["last_arm_mask_raw"]     = arm_raw
+        rt["last_gripper_mask_raw"] = gripper_raw   # 显式覆写：无检测时置 None，避免 stale mask 穿越 reset
         rt["last_frame_np"] = color_np.copy()
 
         final = _compute_final_mask(arm_raw, gripper_raw, cfg["dilate_radius"])
