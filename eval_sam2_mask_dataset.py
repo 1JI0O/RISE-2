@@ -95,10 +95,12 @@ def load_dataset_frames(scene_dir, camera_id):
     for ts in timestamps:
         cp = os.path.join(color_dir, f"{ts}.png")
         dp = os.path.join(depth_dir, f"{ts}.png")
-        if os.path.isfile(dp):
-            frames.append((cp, dp))
-        else:
-            print(f"[dataset] depth not found for ts={ts}, skipped")
+        if not os.path.isfile(dp):
+            raise ValueError(
+                f"Depth file missing for timestamp {ts}: expected {dp}\n"
+                "color/ and depth/ must contain strictly matching PNG filenames."
+            )
+        frames.append((cp, dp))
     print(f"[dataset] loaded {len(frames)} frames from {color_dir}")
     return frames
 
@@ -133,7 +135,7 @@ class DatasetAgent:
 
     def get_global_observation(self):
         if self._idx >= len(self._frames):
-            self._idx = 0               # loop back when exhausted
+            raise StopIteration("[dataset] all frames exhausted")
         color_path, depth_path = self._frames[self._idx]
         self._idx += 1
         return load_dataset_frame(color_path, depth_path)
@@ -1040,11 +1042,9 @@ def evaluate(args_override):
     )
     mask01 = None
 
-    # determine total loop count
-    if dataset_mode and args.get("max_frames"):
-        total_steps = int(args.max_frames)
-    elif dataset_mode:
-        total_steps = len(agent._frames)
+    # determine total loop count (dataset mode: cap at actual frame count)
+    if dataset_mode:
+        total_steps = min(int(args.max_frames), len(agent._frames)) if args.get("max_frames") else len(agent._frames)
     else:
         total_steps = config.deploy.max_steps
 
@@ -1161,7 +1161,7 @@ def evaluate(args_override):
                         image_coords_dev,
                         image_mask_weight = image_mask_weight,
                         actions           = None,
-                    )
+                    ).squeeze(0).cpu().numpy()
                 else:
                     obs_dict = {
                         "coords":       coords,
@@ -1169,7 +1169,7 @@ def evaluate(args_override):
                         "colors":       colors_proc.numpy(),
                         "image_coords": image_coords.numpy(),
                     }
-                    pred_raw_action = policy.infer(obs_dict)["actions"]
+                    pred_raw_action = deepcopy(policy.infer(obs_dict)["actions"])
 
                 action = process_state(pred_raw_action, config, to_control=True)
 

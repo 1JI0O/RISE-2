@@ -17,7 +17,7 @@
 
 ## 数据集目录结构要求
 
-```
+```text
 <scene_dir>/
     <camera_id>/
         color/
@@ -32,15 +32,15 @@
 
 示例：
 
-```
+```text
 /data/haoxiang/data/airexo2/task_0012/train/scene_0001/
     cam_105422061350/
         color/1737546126606.png  1737546159940.png ...
         depth/1737546126606.png  1737546159940.png ...
 ```
 
-- `color/` 和 `depth/` 下的文件名（去掉 `.png`）作为时间戳，二者需对应。
-- 脚本按时间戳升序扫描 `color/`，并在 `depth/` 中查找同名文件；缺失 depth 的帧自动跳过。
+- `color/` 和 `depth/` 下的文件名（去掉 `.png`）作为时间戳，二者必须严格一一对应。
+- 脚本按时间戳升序扫描 `color/`；若任意一帧在 `depth/` 中找不到同名文件，立即报错退出。
 
 ---
 
@@ -52,7 +52,7 @@
 | --- | --- | --- |
 | `--dataset PATH` | str, **required** | 场景目录，见上文结构 |
 | `--camera_id NAME` | str, **required** | 相机子目录名，如 `cam_105422061350` |
-| `--max_frames N` | int, optional | 只处理前 N 帧（超出则循环；默认=全部帧数） |
+| `--max_frames N` | int, optional | 最多处理 N 帧（默认=数据集全部帧数）；帧数用尽即退出 |
 | `--save_vis DIR` | str, optional | 将 mask overlay 图片保存到此目录 |
 
 ### 通用参数（dataset 模式下均为 optional）
@@ -149,7 +149,7 @@ Policy 推理、点云构建、2D mask reweighting 均会实际执行，机器�
 | 坐标投影 | `Projector.project_tcp_to_base_coord()` | 跳过 |
 | Policy | 必须提供 ckpt | 可选，不提供时只跑 SAM2 |
 | `input()` 等待 | rollout 前等待 Enter | 无（立即开始） |
-| 帧数控制 | `config.deploy.max_steps` | `min(--max_frames, 总帧数)` |
+| 帧数控制 | `config.deploy.max_steps` | `--max_frames`（不足时循环，默认=数据集帧数） |
 | mask 可视化 | `config.deploy.vis=True` 时 | `--save_vis DIR` 时 |
 | Calib 文件 | 必须提供 | 不需要 |
 | 相机内参 | 从 agent 读取 | 使用 `fake_intrinsics`（硬编码） |
