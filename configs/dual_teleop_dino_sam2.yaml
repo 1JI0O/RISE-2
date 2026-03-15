@@ -109,6 +109,7 @@ mask_aware:
     config_file: configs/sam2.1/sam2.1_hiera_b+.yaml
     ckpt_path: /data/haoxiang/logs/sam2_finetune/airexo_task0013/checkpoints/checkpoint.pt
     device: cuda_if_available
+    dilate_radius: 8
     remote_port: 8976
 
 

@@ -272,24 +272,98 @@ class SAM2MaskServer:
 
     # ── core inference (blocking, runs in executor thread) ──────────────────
 
-    def _infer(self, color_np: np.ndarray):
-        """
-        Identical logic to eval_mask_final.infer_mask, using self._rt.
-        Returns uint8 (H,W) mask (0/255) or None.
-        """
-        rt  = self._rt
+    def _collect_masks_from_points(self, predictor, state, cfg, points, labels):
+        arm_id = cfg["arm_obj_id"]
+        grp_id = cfg["gripper_obj_id"]
+
+        points = points or {}
+        labels = labels or {}
+
+        masks = {arm_id: None, grp_id: None}
+        predictor.reset_state(state)
+
+        for oid, key in ((arm_id, "arm"), (grp_id, "gripper")):
+            pts = points.get(key, []) or []
+            lbs = labels.get(key, []) or []
+            if len(pts) == 0 or len(lbs) == 0:
+                continue
+
+            pts_np = np.asarray(pts, dtype=np.float32)
+            lbs_np = np.asarray(lbs, dtype=np.int32)
+            if pts_np.ndim != 2 or pts_np.shape[1] != 2:
+                raise ValueError(f"invalid points[{key}] shape: {pts_np.shape}")
+            if lbs_np.ndim != 1 or lbs_np.shape[0] != pts_np.shape[0]:
+                raise ValueError(
+                    f"labels[{key}] shape {lbs_np.shape} does not match points {pts_np.shape}"
+                )
+
+            with torch.inference_mode():
+                _, obj_ids_out, logits = predictor.add_new_points_or_box(
+                    state,
+                    frame_idx=0,
+                    obj_id=oid,
+                    points=pts_np,
+                    labels=lbs_np,
+                    normalize_coords=True,
+                )
+            if oid in list(obj_ids_out):
+                idx = list(obj_ids_out).index(oid)
+                masks[oid] = (logits[idx].squeeze().cpu().numpy() > 0.0)
+
+        return masks[arm_id], masks[grp_id]
+
+    def _infer(self, color_np: np.ndarray, op: str = "infer", points=None, labels=None):
+        """Unified SAM2 handler for infer / cold-start preview / cold-start commit."""
+        rt = self._rt
         cfg = rt["cfg"]
         rt["last_fail_reason"] = None
 
         if color_np.ndim != 3 or color_np.shape[2] != 3:
             rt["last_fail_reason"] = "sam2_invalid_color"
-            return None
+            return {"reason": rt["last_fail_reason"], "mask": None}
         if color_np.dtype != np.uint8:
             color_np = np.clip(color_np, 0, 255).astype(np.uint8)
 
         predictor = rt["predictor"]
 
-        # ── cold start ──────────────────────────────────────────────────────
+        # ── explicit remote cold-start path (UI in client, model on server) ──
+        if op in ("cold_start_preview", "cold_start_commit"):
+            try:
+                state = _build_state_from_frame(predictor, color_np)
+                arm_raw, gripper_raw = self._collect_masks_from_points(
+                    predictor, state, cfg, points=points, labels=labels
+                )
+            except Exception:
+                rt["last_fail_reason"] = "sam2_cold_start_exception"
+                if op == "cold_start_preview":
+                    return {
+                        "reason": rt["last_fail_reason"],
+                        "arm_mask": None,
+                        "gripper_mask": None,
+                    }
+                return {"reason": rt["last_fail_reason"], "mask": None}
+
+            if op == "cold_start_preview":
+                return {
+                    "reason": rt["last_fail_reason"],
+                    "arm_mask": (arm_raw.astype(np.uint8) * 255) if arm_raw is not None else None,
+                    "gripper_mask": (gripper_raw.astype(np.uint8) * 255) if gripper_raw is not None else None,
+                }
+
+            if arm_raw is None:
+                rt["last_fail_reason"] = "sam2_cold_start_aborted"
+                return {"reason": rt["last_fail_reason"], "mask": None}
+
+            rt["inference_state"] = state
+            rt["frame_idx"] = 0
+            rt["last_arm_mask_raw"] = arm_raw
+            rt["last_gripper_mask_raw"] = gripper_raw
+            rt["last_reset_frame_idx"] = 0
+            rt["last_frame_np"] = color_np.copy()
+            final = _compute_final_mask(arm_raw, gripper_raw, cfg["dilate_radius"])
+            return {"reason": rt["last_fail_reason"], "mask": (final.astype(np.uint8) * 255)}
+
+        # ── legacy infer path (kept for compatibility with old clients) ───────
         if rt["inference_state"] is None:
             try:
                 state = _build_state_from_frame(predictor, color_np)
@@ -298,25 +372,25 @@ class SAM2MaskServer:
                 )
             except Exception:
                 rt["last_fail_reason"] = "sam2_cold_start_exception"
-                return None
+                return {"reason": rt["last_fail_reason"], "mask": None}
             if arm_raw is None:
                 rt["last_fail_reason"] = "sam2_cold_start_aborted"
-                return None
-            rt["inference_state"]       = state
-            rt["frame_idx"]             = 0
-            rt["last_arm_mask_raw"]     = arm_raw
+                return {"reason": rt["last_fail_reason"], "mask": None}
+            rt["inference_state"] = state
+            rt["frame_idx"] = 0
+            rt["last_arm_mask_raw"] = arm_raw
             rt["last_gripper_mask_raw"] = gripper_raw
-            rt["last_reset_frame_idx"]  = 0
-            rt["last_frame_np"]         = color_np.copy()
+            rt["last_reset_frame_idx"] = 0
+            rt["last_frame_np"] = color_np.copy()
             final = _compute_final_mask(arm_raw, gripper_raw, cfg["dilate_radius"])
-            return (final.astype(np.uint8) * 255)
+            return {"reason": rt["last_fail_reason"], "mask": (final.astype(np.uint8) * 255)}
 
         # ── subsequent frames ────────────────────────────────────────────────
-        state          = rt["inference_state"]
-        frame_idx      = rt["frame_idx"]
+        state = rt["inference_state"]
+        frame_idx = rt["frame_idx"]
         last_reset_idx = rt["last_reset_frame_idx"]
-        arm_raw_prev   = rt["last_arm_mask_raw"]
-        grp_raw_prev   = rt["last_gripper_mask_raw"]
+        arm_raw_prev = rt["last_arm_mask_raw"]
+        grp_raw_prev = rt["last_gripper_mask_raw"]
 
         need_reset = (
             cfg["reset_every_n_steps"] > 0
@@ -342,13 +416,13 @@ class SAM2MaskServer:
                             mask=torch.tensor(grp_raw_prev, device=predictor.device),
                         )
                 _append_frame(predictor, state, color_np)
-                rt["inference_state"]      = state
-                rt["frame_idx"]            = 1
+                rt["inference_state"] = state
+                rt["frame_idx"] = 1
                 rt["last_reset_frame_idx"] = 1
                 frame_idx = 1
             except Exception:
                 rt["last_fail_reason"] = "sam2_reset_exception"
-                return None
+                return {"reason": rt["last_fail_reason"], "mask": None}
         else:
             try:
                 _append_frame(predictor, state, color_np)
@@ -356,7 +430,7 @@ class SAM2MaskServer:
                 rt["frame_idx"] = frame_idx
             except Exception:
                 rt["last_fail_reason"] = "sam2_append_exception"
-                return None
+                return {"reason": rt["last_fail_reason"], "mask": None}
 
         # ── propagate ───────────────────────────────────────────────────────
         arm_raw = gripper_raw = None
@@ -373,18 +447,18 @@ class SAM2MaskServer:
                             gripper_raw = m
         except Exception:
             rt["last_fail_reason"] = "sam2_propagate_fail"
-            return None
+            return {"reason": rt["last_fail_reason"], "mask": None}
 
         if arm_raw is None:
             rt["last_fail_reason"] = "sam2_propagate_fail"
-            return None
+            return {"reason": rt["last_fail_reason"], "mask": None}
 
-        rt["last_arm_mask_raw"]     = arm_raw
-        rt["last_gripper_mask_raw"] = gripper_raw   # 显式覆写：无检测时置 None，避免 stale mask 穿越 reset
+        rt["last_arm_mask_raw"] = arm_raw
+        rt["last_gripper_mask_raw"] = gripper_raw
         rt["last_frame_np"] = color_np.copy()
 
         final = _compute_final_mask(arm_raw, gripper_raw, cfg["dilate_radius"])
-        return (final.astype(np.uint8) * 255)
+        return {"reason": rt["last_fail_reason"], "mask": (final.astype(np.uint8) * 255)}
 
     # ── WebSocket handler ────────────────────────────────────────────────────
 
@@ -398,12 +472,24 @@ class SAM2MaskServer:
             try:
                 raw = await websocket.recv()
                 req = msgpack_numpy.unpackb(raw)
+                if not isinstance(req, dict):
+                    raise ValueError(f"request must be dict, got {type(req)}")
 
                 color_np = np.asarray(req["color"])
-                mask = await loop.run_in_executor(self._executor, self._infer, color_np)
+                op = str(req.get("op", "infer"))
+                points = req.get("points", None)
+                labels = req.get("labels", None)
 
-                reason = self._rt.get("last_fail_reason") if self._rt else None
-                await websocket.send(packer.pack({"mask": mask, "reason": reason}))
+                resp = await loop.run_in_executor(
+                    self._executor,
+                    self._infer,
+                    color_np,
+                    op,
+                    points,
+                    labels,
+                )
+
+                await websocket.send(packer.pack(resp))
 
             except websockets.ConnectionClosed:
                 print(f"[sam2-server] client disconnected: {websocket.remote_address}")

@@ -80,8 +80,8 @@
 ```bash
 # 终端 1（sam2 环境）
 conda run -n sam2 python sam2_mask_server.py \
-    --config configs/dual_teleop_dino_sam2.yaml --port 8765
-# 等待打印：[sam2-server] listening on ws://0.0.0.0:8765
+    --config configs/dual_teleop_dino_sam2.yaml --port 8976
+# 等待打印：[sam2-server] listening on ws://0.0.0.0:8976
 
 # 终端 2（rise2 环境）
 conda activate rise2
@@ -93,14 +93,14 @@ python eval_sam2_mask_dataset.py \
     --save_vis /data/haoxiang/data/airexo2/task_0012/train/scene_0001/sam2_seg_test
 ```
 
-YAML 中必须设置 `remote_port: 8765`：
+YAML 中必须设置 `remote_port: 8976`：
 
 ```yaml
 mask_aware:
   enabled: true
   sam2:
     enabled: true
-    remote_port: 8765
+    remote_port: 8976
 ```
 
 启动后流程：
@@ -200,3 +200,25 @@ python eval_sam2_mask_dataset.py \
 - 增加握手载荷校验（必须收到 `{"status": "ready"}`），并在异常时自动重试而非直接禁用 mask。
 
 这次修复后，`sam2_mask_server.py` 已在本机监听时，dataset eval 会持续重试直至连通，避免因代理/握手异常提前退出。
+
+### 追加修复（2026-03-15，首帧标注改到 rise2 侧）
+
+需求：保留原有标注交互逻辑（按键/点选/可视化行为不改），但首帧弹窗必须出现在
+`rise2` 侧（运行 [`eval_sam2_mask_dataset.py`](eval_sam2_mask_dataset.py) 的终端会话）。
+
+实现：
+
+- 客户端 [`eval_sam2_mask_dataset.py`](eval_sam2_mask_dataset.py) 新增远程冷启动交互流程：
+  - 本地弹窗与按键逻辑沿用同一套交互语义；
+  - 每次点选后通过 WebSocket 请求服务端返回 `arm_mask/gripper_mask` 预览；
+  - 确认后发送 commit，服务端写入 inference state，后续继续常规逐帧 `infer`。
+- 服务端 [`sam2_mask_server.py`](sam2_mask_server.py) 新增 `op` 协议：
+  - `cold_start_preview`：仅根据点集回传预览 mask，不落状态；
+  - `cold_start_commit`：根据点集建立冷启动状态并返回最终 mask；
+  - `infer`：沿用原逐帧追踪逻辑。
+
+效果：
+
+- SAM2 模型仍在 `sam2` 环境推理；
+- 首帧标注窗口转移到 `rise2` 端弹出；
+- 标注逻辑本身（快捷键/正负点/重置/确认）保持一致。

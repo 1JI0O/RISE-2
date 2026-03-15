@@ -361,6 +361,7 @@ def _init_sam2_remote_client(port):
                 "conn":             conn,
                 "packer":           packer,
                 "last_fail_reason": None,
+                "cold_started":     False,
             }
         except ConnectionRefusedError:
             print(f"[mask-aware/sam2] waiting for sam2 server on port {port}...")
@@ -395,7 +396,9 @@ def _import_build_sam2_video_predictor():
 
 def _init_sam2_runtime(sam2_cfg):
     if getattr(sam2_cfg, "remote_port", None) is not None:
-        return _init_sam2_remote_client(sam2_cfg.remote_port)
+        runtime = _init_sam2_remote_client(sam2_cfg.remote_port)
+        runtime["cfg"] = sam2_cfg
+        return runtime
 
     build_sam2_video_predictor = _import_build_sam2_video_predictor()
     device = _resolve_sam2_device(sam2_cfg.device)
@@ -610,6 +613,143 @@ def _compute_final_mask(arm_raw, gripper_raw, dilate_radius):
     return arm_dilated
 
 
+def _remote_sam2_rpc(payload):
+    from remote_eval import msgpack_numpy as _mnp
+
+    global _sam2_runtime
+    _sam2_runtime["conn"].send(_sam2_runtime["packer"].pack(payload))
+    resp = _mnp.unpackb(_sam2_runtime["conn"].recv())
+    if not isinstance(resp, dict):
+        raise RuntimeError(f"unexpected remote response type: {type(resp)}")
+    return resp
+
+
+
+def _remote_cold_start_interactive(color_np):
+    """Remote SAM2 cold start with local UI (popup on rise2 side)."""
+    global _sam2_runtime
+    cfg = _sam2_runtime["cfg"]
+
+    ARM_OBJ_ID    = int(cfg.arm_obj_id)
+    GRP_OBJ_ID    = int(cfg.gripper_obj_id)
+    ARM_COLOR_BGR = (0, 120, 220)
+    GRP_COLOR_BGR = (0, 140, 255)
+    WIN = "SAM2 Cold Start  [a]=ARM [g]=GRIPPER [r]=Reset [Enter/Space]=Done [ESC]=Abort"
+
+    state = {
+        "active_obj": ARM_OBJ_ID,
+        "points":     {ARM_OBJ_ID: [], GRP_OBJ_ID: []},
+        "labels":     {ARM_OBJ_ID: [], GRP_OBJ_ID: []},
+        "masks":      {ARM_OBJ_ID: None, GRP_OBJ_ID: None},
+    }
+
+    def _pack_points_labels():
+        return {
+            "points": {
+                "arm": state["points"][ARM_OBJ_ID],
+                "gripper": state["points"][GRP_OBJ_ID],
+            },
+            "labels": {
+                "arm": state["labels"][ARM_OBJ_ID],
+                "gripper": state["labels"][GRP_OBJ_ID],
+            },
+        }
+
+    def _refresh_masks():
+        payload = {
+            "op": "cold_start_preview",
+            "color": color_np,
+            **_pack_points_labels(),
+        }
+        resp = _remote_sam2_rpc(payload)
+        _sam2_runtime["last_fail_reason"] = resp.get("reason")
+
+        arm_m = resp.get("arm_mask")
+        grp_m = resp.get("gripper_mask")
+        state["masks"][ARM_OBJ_ID] = (np.asarray(arm_m) > 0) if arm_m is not None else None
+        state["masks"][GRP_OBJ_ID] = (np.asarray(grp_m) > 0) if grp_m is not None else None
+
+    def _render():
+        disp = color_np.copy().astype(np.float32)
+        for oid, bgr in [(ARM_OBJ_ID, ARM_COLOR_BGR), (GRP_OBJ_ID, GRP_COLOR_BGR)]:
+            m = state["masks"][oid]
+            if m is not None:
+                c_rgb = np.array([bgr[2], bgr[1], bgr[0]], dtype=np.float32)
+                disp[m] = disp[m] * 0.55 + c_rgb * 0.45
+        disp = np.clip(disp, 0, 255).astype(np.uint8)
+        for oid, bgr in [(ARM_OBJ_ID, ARM_COLOR_BGR), (GRP_OBJ_ID, GRP_COLOR_BGR)]:
+            for (x, y), lbl in zip(state["points"][oid], state["labels"][oid]):
+                marker = cv2.MARKER_STAR if lbl == 1 else cv2.MARKER_CROSS
+                cv2.drawMarker(disp, (int(x), int(y)), bgr, marker, 18, 2)
+        obj_name = "ARM" if state["active_obj"] == ARM_OBJ_ID else "GRIPPER"
+        cv2.putText(disp, f"Active: {obj_name}", (10, 32),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+        return cv2.cvtColor(disp, cv2.COLOR_RGB2BGR)
+
+    def on_mouse(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            state["points"][state["active_obj"]].append([x, y])
+            state["labels"][state["active_obj"]].append(1)
+            _refresh_masks()
+            cv2.imshow(WIN, _render())
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            state["points"][state["active_obj"]].append([x, y])
+            state["labels"][state["active_obj"]].append(0)
+            _refresh_masks()
+            cv2.imshow(WIN, _render())
+
+    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(WIN, on_mouse)
+    cv2.imshow(WIN, cv2.cvtColor(color_np, cv2.COLOR_RGB2BGR))
+    print("[mask-aware/sam2] Cold start (remote model): annotate arm [a] and gripper [g] on frame 0.")
+    print("  Left=positive  Right=negative  [r]=reset active obj  Enter/Space=done  ESC=abort")
+
+    while True:
+        key = cv2.waitKey(30) & 0xFF
+        if key == ord('a'):
+            state["active_obj"] = ARM_OBJ_ID
+            print(f"[cold-start] active -> ARM (obj={ARM_OBJ_ID})")
+            cv2.imshow(WIN, _render())
+        elif key == ord('g'):
+            state["active_obj"] = GRP_OBJ_ID
+            print(f"[cold-start] active -> GRIPPER (obj={GRP_OBJ_ID})")
+            cv2.imshow(WIN, _render())
+        elif key == ord('r'):
+            oid = state["active_obj"]
+            state["points"][oid].clear()
+            state["labels"][oid].clear()
+            state["masks"][oid] = None
+            _refresh_masks()
+            cv2.imshow(WIN, _render())
+            print(f"[cold-start] reset obj={oid}")
+        elif key in (13, 32):
+            cv2.destroyWindow(WIN)
+            break
+        elif key == 27:
+            cv2.destroyWindow(WIN)
+            _sam2_runtime["last_fail_reason"] = "sam2_cold_start_aborted"
+            print("[cold-start] ESC: aborting cold start")
+            return None
+
+    payload = {
+        "op": "cold_start_commit",
+        "color": color_np,
+        **_pack_points_labels(),
+    }
+    resp = _remote_sam2_rpc(payload)
+    _sam2_runtime["last_fail_reason"] = resp.get("reason")
+    mask = resp.get("mask")
+    if mask is None:
+        return None
+
+    _sam2_runtime["cold_started"] = True
+    n_arm = sum(l == 1 for l in state["labels"][ARM_OBJ_ID])
+    n_grp = sum(l == 1 for l in state["labels"][GRP_OBJ_ID])
+    print(f"[cold-start] confirmed: arm={n_arm} pos pts, gripper={n_grp} pos pts")
+    return mask
+
+
+
 def infer_mask(color, depth, proprio, meta, agent=None):
     """Run SAM2 VideoPredictor online tracking for arm (obj=1) and gripper (obj=2).
 
@@ -623,13 +763,15 @@ def infer_mask(color, depth, proprio, meta, agent=None):
 
     # ── remote mode ──────────────────────────────────────────────────────────
     if _sam2_runtime.get("mode") == "remote":
-        from remote_eval import msgpack_numpy as _mnp
         color_np = np.asarray(color)
         if color_np.dtype != np.uint8:
             color_np = np.clip(color_np, 0, 255).astype(np.uint8)
+
         try:
-            _sam2_runtime["conn"].send(_sam2_runtime["packer"].pack({"color": color_np}))
-            resp = _mnp.unpackb(_sam2_runtime["conn"].recv())
+            if not bool(_sam2_runtime.get("cold_started", False)):
+                return _remote_cold_start_interactive(color_np)
+
+            resp = _remote_sam2_rpc({"op": "infer", "color": color_np})
             _sam2_runtime["last_fail_reason"] = resp.get("reason")
             return resp.get("mask")
         except Exception as exc:
