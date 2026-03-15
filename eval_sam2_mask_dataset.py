@@ -15,6 +15,7 @@ Policy inference runs only if --ckpt is provided; otherwise only SAM2 is tested.
 """
 
 import os
+import sys
 import yaml
 import torch
 import argparse
@@ -34,7 +35,15 @@ from dataset.projector import SingleArmProjector, DualArmProjector
 
 from collections import OrderedDict
 
+# Remove project root from sys.path before importing sam2 to prevent the local
+# sam2/ subdirectory from shadowing the installed sam2 package.
+_project_root = os.path.dirname(os.path.abspath(__file__))
+_removed = _project_root in sys.path
+if _removed:
+    sys.path.remove(_project_root)
 from sam2.build_sam import build_sam2_video_predictor
+if _removed:
+    sys.path.insert(0, _project_root)
 
 import cv2
 
