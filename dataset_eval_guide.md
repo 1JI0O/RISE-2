@@ -70,38 +70,20 @@
 
 ## 典型启动命令
 
-### 场景 A：纯 SAM2 测试（不跑 policy）
+> `rise2` 和 `sam2` conda 环境**不兼容**，SAM2 必须以独立服务运行。
+> 所有场景均需先在终端 1 启动 SAM2 服务端，再在终端 2 运行 dataset eval。
 
-最常用，只需 SAM2 环境或本地 SAM2 模型权重。
+### 场景 A：纯 SAM2 追踪测试（不跑 policy）
 
-```bash
-conda activate rise2
-python eval_sam2_mask_dataset.py \
-    --config configs/dual_teleop_dino.yaml \
-    --dataset /data/haoxiang/data/airexo2/task_0012/train/scene_0001 \
-    --camera_id cam_105422061350 \
-    --max_frames 100 \
-    --save_vis /tmp/sam2_vis_test
-```
-
-启动后：
-
-1. SAM2 模型加载（约 5–10 s）
-2. `t=0`：弹出 cv2 标注窗口，用鼠标标注机械臂（按 `[a]`）和 gripper（按 `[g]`），按 `Enter` 确认
-3. `t=1…N`：SAM2 自动逐帧追踪，mask overlay 图片保存到 `--save_vis` 目录
-4. 结束时打印 `mask_stats` 汇总
-
-### 场景 B：使用远程 SAM2 服务（跨 conda 环境）
-
-SAM2 运行在独立的 `sam2` 环境中，通过 WebSocket 提供服务：
+最常用，验证 SAM2 冷启动标注与逐帧追踪。
 
 ```bash
-# 终端 1：sam2 环境启动服务端
+# 终端 1（sam2 环境）
 conda run -n sam2 python sam2_mask_server.py \
     --config configs/dual_teleop_dino.yaml --port 8765
-# 等待打印：[sam2-server] listening on ...
+# 等待打印：[sam2-server] listening on ws://0.0.0.0:8765
 
-# 终端 2：rise2 环境启动 dataset eval
+# 终端 2（rise2 环境）
 conda activate rise2
 python eval_sam2_mask_dataset.py \
     --config configs/dual_teleop_dino.yaml \
@@ -111,7 +93,7 @@ python eval_sam2_mask_dataset.py \
     --save_vis /tmp/sam2_vis_test
 ```
 
-YAML 中需加 `remote_port: 8765`：
+YAML 中必须设置 `remote_port: 8765`：
 
 ```yaml
 mask_aware:
@@ -121,11 +103,22 @@ mask_aware:
     remote_port: 8765
 ```
 
-远程模式下标注窗口在**终端 1（sam2 环境）**弹出。
+启动后流程：
 
-### 场景 C：完整 pipeline 测试（含 policy 推理，不执行 robot action）
+1. 终端 2 连接 SAM2 服务，`t=0`：标注窗口在**终端 1** 弹出，标注机械臂（`[a]`）和 gripper（`[g]`），按 `Enter` 确认
+2. `t=1…N`：SAM2 自动逐帧追踪，mask overlay 图片保存到 `--save_vis` 目录
+3. 帧数用尽即退出，打印 `mask_stats` 汇总
+
+### 场景 B：完整 pipeline 测试（含 policy 推理，不执行 robot action）
+
+在场景 A 基础上加 `--ckpt`，policy 推理、点云构建、2D mask reweighting 均会实际执行，`agent.action()` 被静默忽略。
 
 ```bash
+# 终端 1（sam2 环境）—— 同场景 A
+conda run -n sam2 python sam2_mask_server.py \
+    --config configs/dual_teleop_dino.yaml --port 8765
+
+# 终端 2（rise2 环境）
 conda activate rise2
 python eval_sam2_mask_dataset.py \
     --config configs/dual_teleop_dino.yaml \
@@ -135,8 +128,6 @@ python eval_sam2_mask_dataset.py \
     --max_frames 60 \
     --save_vis /tmp/sam2_vis_test
 ```
-
-Policy 推理、点云构建、2D mask reweighting 均会实际执行，机器人动作（`agent.action()`）被静默忽略。
 
 ---
 
@@ -149,7 +140,7 @@ Policy 推理、点云构建、2D mask reweighting 均会实际执行，机器�
 | 坐标投影 | `Projector.project_tcp_to_base_coord()` | 跳过 |
 | Policy | 必须提供 ckpt | 可选，不提供时只跑 SAM2 |
 | `input()` 等待 | rollout 前等待 Enter | 无（立即开始） |
-| 帧数控制 | `config.deploy.max_steps` | `--max_frames`（不足时循环，默认=数据集帧数） |
+| 帧数控制 | `config.deploy.max_steps` | `--max_frames`（不足时停止，默认=数据集帧数） |
 | mask 可视化 | `config.deploy.vis=True` 时 | `--save_vis DIR` 时 |
 | Calib 文件 | 必须提供 | 不需要 |
 | 相机内参 | 从 agent 读取 | 使用 `fake_intrinsics`（硬编码） |
