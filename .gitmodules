@@ -13,4 +13,4 @@
 [submodule "sam2"]
 	path = sam2
 	url = https://github.com/1JI0O/sam2.git
-    ignore = all
+	branch = sam2_rise2
