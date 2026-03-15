@@ -106,7 +106,10 @@ mask_aware:
   log_alignment_preview: false
   sam2:
     enabled: true
-    remote_port: 8765
+    config_file: configs/sam2.1/sam2.1_hiera_b+.yaml
+    ckpt_path: /data/haoxiang/logs/sam2_finetune/airexo_task0013/checkpoints/checkpoint.pt
+    device: cuda_if_available
+    remote_port: 8976
 
 
 model:
