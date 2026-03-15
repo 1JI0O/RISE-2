@@ -30,14 +30,20 @@ import websockets.frames
 
 # ── path setup ──────────────────────────────────────────────────────────────
 # Run from project root: python sam2_mask_server.py
-# sys.path needs project root so that `remote_eval` and `sam2` packages resolve
 import os as _os
 _project_root = _os.path.dirname(_os.path.abspath(__file__))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 from remote_eval import msgpack_numpy           # existing serialization layer
+
+# Remove project root before importing sam2 so the installed sam2 package is
+# found rather than the local sam2/ subdirectory (which would shadow it).
+if _project_root in sys.path:
+    sys.path.remove(_project_root)
 from sam2.build_sam import build_sam2_video_predictor
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 
 # ════════════════════════════════════════════════════════════════════════════
