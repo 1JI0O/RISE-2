@@ -15,7 +15,6 @@ Policy inference runs only if --ckpt is provided; otherwise only SAM2 is tested.
 """
 
 import os
-import sys
 import yaml
 import torch
 import argparse
@@ -34,16 +33,6 @@ from dataset.data_utils import resize_image, ImageProcessor
 from dataset.projector import SingleArmProjector, DualArmProjector
 
 from collections import OrderedDict
-
-# Remove project root from sys.path before importing sam2 to prevent the local
-# sam2/ subdirectory from shadowing the installed sam2 package.
-_project_root = os.path.dirname(os.path.abspath(__file__))
-_removed = _project_root in sys.path
-if _removed:
-    sys.path.remove(_project_root)
-from sam2.build_sam import build_sam2_video_predictor
-if _removed:
-    sys.path.insert(0, _project_root)
 
 import cv2
 
@@ -338,10 +327,33 @@ def _init_sam2_remote_client(port):
 
     uri = f"ws://127.0.0.1:{port}"
     packer = _mnp.Packer()
+
+    def _connect_once():
+        # websockets>=15 may auto-detect proxy from env; disable it explicitly for localhost.
+        try:
+            return websockets.sync.client.connect(
+                uri,
+                compression=None,
+                max_size=None,
+                proxy=None,
+            )
+        except TypeError:
+            # Backward compatibility with older websockets versions without `proxy` kwarg.
+            return websockets.sync.client.connect(uri, compression=None, max_size=None)
+
     while True:
         try:
-            conn = websockets.sync.client.connect(uri, compression=None, max_size=None)
-            _mnp.unpackb(conn.recv())   # wait for {"status": "ready"} handshake
+            conn = _connect_once()
+            try:
+                ready = _mnp.unpackb(conn.recv())
+            except Exception:
+                conn.close()
+                raise
+
+            if not isinstance(ready, dict) or ready.get("status") != "ready":
+                conn.close()
+                raise RuntimeError(f"unexpected SAM2 server handshake payload: {ready!r}")
+
             print(f"[mask-aware/sam2] connected to remote server at {uri}")
             return {
                 "mode":             "remote",
@@ -353,12 +365,39 @@ def _init_sam2_remote_client(port):
         except ConnectionRefusedError:
             print(f"[mask-aware/sam2] waiting for sam2 server on port {port}...")
             time.sleep(2)
+        except Exception as exc:
+            print(
+                f"[mask-aware/sam2] connect failed ({type(exc).__name__}): {exc}; retrying..."
+            )
+            time.sleep(2)
+
+
+def _import_build_sam2_video_predictor():
+    """Lazy import for local SAM2 mode only.
+
+    Keep project root out of sys.path during import so local sam2/ source tree
+    does not shadow the installed SAM2 package.
+    """
+    import sys
+
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    removed = project_root in sys.path
+    if removed:
+        sys.path.remove(project_root)
+    try:
+        from sam2.build_sam import build_sam2_video_predictor as _builder
+    finally:
+        if removed:
+            sys.path.insert(0, project_root)
+    return _builder
+
 
 
 def _init_sam2_runtime(sam2_cfg):
     if getattr(sam2_cfg, "remote_port", None) is not None:
         return _init_sam2_remote_client(sam2_cfg.remote_port)
 
+    build_sam2_video_predictor = _import_build_sam2_video_predictor()
     device = _resolve_sam2_device(sam2_cfg.device)
     predictor = build_sam2_video_predictor(
         config_file=sam2_cfg.config_file,

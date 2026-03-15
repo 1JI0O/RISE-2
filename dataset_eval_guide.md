@@ -163,3 +163,40 @@ python eval_sam2_mask_dataset.py \
 | `sam2_cold_start_aborted` | 用户按 ESC 放弃标注 |
 | `sam2_remote_exception` | 远程服务调用失败 |
 | `infer_none` | SAM2 返回 None（含以上所有原因） |
+
+---
+
+## 变更记录（2026-03-15）
+
+### 修复内容
+
+已修复 [`eval_sam2_mask_dataset.py`](eval_sam2_mask_dataset.py) 在 **remote SAM2 模式** 下仍会于模块导入阶段强制执行
+`from sam2.build_sam import build_sam2_video_predictor` 导致的启动失败问题。
+
+修复后行为：
+
+- 当 [`mask_aware.sam2.remote_port`](configs/dual_teleop_dino_sam2.yaml:112) 非空时，脚本仅连接远程 [`sam2_mask_server.py`](sam2_mask_server.py)，
+  **不会在 rise2 环境中导入本地 sam2 Python 包**。
+- 仅当你显式使用本地 SAM2（`remote_port: null`）时，才会懒加载导入 `build_sam2_video_predictor`。
+
+### 代码实现说明
+
+在 [`_init_sam2_runtime()`](eval_sam2_mask_dataset.py:376) 中，local 分支改为调用懒加载函数
+[`_import_build_sam2_video_predictor()`](eval_sam2_mask_dataset.py:352) 动态导入。
+该导入函数会临时移除 project root 的 [`sys.path`](eval_sam2_mask_dataset.py:359) 项，避免本地 `sam2/` 目录遮蔽已安装包。
+
+### 对现有使用方式的影响
+
+- 你当前“远程端口一直在跑”的用法保持不变，继续使用原命令即可。
+- 不再需要在 [`rise2`](README.md:20) 环境额外安装 sam2 才能启动 dataset eval。
+
+### 追加修复（2026-03-15，远程连接握手）
+
+针对日志中的 `did not receive a valid HTTP response`，已在
+[`_init_sam2_remote_client()`](eval_sam2_mask_dataset.py:322) 增强远程连接逻辑：
+
+- 连接时显式设置 `proxy=None`（兼容 [`websockets==15`](requirements.txt:16) 的代理自动发现行为），避免 localhost 被环境代理干扰。
+- 对旧版 `websockets` 保留回退分支（无 `proxy` 参数时自动降级调用）。
+- 增加握手载荷校验（必须收到 `{"status": "ready"}`），并在异常时自动重试而非直接禁用 mask。
+
+这次修复后，`sam2_mask_server.py` 已在本机监听时，dataset eval 会持续重试直至连通，避免因代理/握手异常提前退出。
