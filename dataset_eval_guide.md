@@ -80,17 +80,17 @@
 ```bash
 # 终端 1（sam2 环境）
 conda run -n sam2 python sam2_mask_server.py \
-    --config configs/dual_teleop_dino.yaml --port 8765
+    --config configs/dual_teleop_dino_sam2.yaml --port 8765
 # 等待打印：[sam2-server] listening on ws://0.0.0.0:8765
 
 # 终端 2（rise2 环境）
 conda activate rise2
 python eval_sam2_mask_dataset.py \
-    --config configs/dual_teleop_dino.yaml \
+    --config configs/dual_teleop_dino_sam2.yaml \
     --dataset /data/haoxiang/data/airexo2/task_0012/train/scene_0001 \
     --camera_id cam_105422061350 \
     --max_frames 100 \
-    --save_vis /tmp/sam2_vis_test
+    --save_vis /data/haoxiang/data/airexo2/task_0012/train/scene_0001/sam2_seg_test
 ```
 
 YAML 中必须设置 `remote_port: 8765`：
@@ -116,7 +116,7 @@ mask_aware:
 ```bash
 # 终端 1（sam2 环境）—— 同场景 A
 conda run -n sam2 python sam2_mask_server.py \
-    --config configs/dual_teleop_dino.yaml --port 8765
+    --config configs/dual_teleop_dino_sam2.yaml --port 8765
 
 # 终端 2（rise2 环境）
 conda activate rise2

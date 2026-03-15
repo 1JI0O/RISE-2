@@ -28,7 +28,7 @@ from easydict import EasyDict as edict
 from utils.training import set_seed
 from utils.ensemble import EnsembleBuffer
 # from remote_eval import WebsocketClientPolicy
-from eval_agent import SingleArmAgent, DualArmAgent
+# from eval_agent import SingleArmAgent, DualArmAgent
 from dataset.data_utils import resize_image, ImageProcessor
 from dataset.projector import SingleArmProjector, DualArmProjector
 
