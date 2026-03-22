@@ -116,17 +116,17 @@ mask_aware:
 ```bash
 # 终端 1（sam2 环境）—— 同场景 A
 conda run -n sam2 python sam2_mask_server.py \
-    --config configs/dual_teleop_dino_sam2.yaml --port 8765
+    --config configs/dual_teleop_dino_sam2.yaml --port 8976
 
 # 终端 2（rise2 环境）
 conda activate rise2
 python eval_sam2_mask_dataset.py \
-    --config configs/dual_teleop_dino.yaml \
+    --config configs/dual_teleop_dino_sam2.yaml \
     --dataset /data/haoxiang/data/airexo2/task_0012/train/scene_0001 \
     --camera_id cam_105422061350 \
-    --ckpt logs/your_checkpoint/checkpoint.pth \
+    --ckpt /data/haoxiang/logs/airexo_task0012_mask_aware/policy_step_57500_seed_233.ckpt \
     --max_frames 60 \
-    --save_vis /tmp/sam2_vis_test
+    --save_vis /data/haoxiang/data/airexo2/task_0012/train/scene_0001/policy_sam_test
 ```
 
 ---
@@ -152,7 +152,7 @@ python eval_sam2_mask_dataset.py \
 
 ## 输出说明
 
-- **终端输出**：每步 SAM2 状态、mask 失败原因、末尾 `mask_stats` 汇总
+- **终端输出**：每步 SAM2 状态、mask 失败原因、policy 推理步动作打印、末尾 `mask_stats` 汇总
 - **`--save_vis DIR/`**：`step_000000_overlay.png`、`step_000001_overlay.png`… 红色半透明覆盖表示 mask 区域
 - **`mask_stats` 含义**：
 
@@ -200,6 +200,14 @@ python eval_sam2_mask_dataset.py \
 - 增加握手载荷校验（必须收到 `{"status": "ready"}`），并在异常时自动重试而非直接禁用 mask。
 
 这次修复后，`sam2_mask_server.py` 已在本机监听时，dataset eval 会持续重试直至连通，避免因代理/握手异常提前退出。
+
+### 追加修复（2026-03-15，dataset 模式可视化与动作可见性）
+
+- 去掉 dataset 流程里由 `config.deploy.vis=True` 触发的掩码文件落盘（`[vis] saved mask...` / `[vis] saved mask overlay...`）。
+  现在 dataset 模式只受 `--save_vis` 控制掩码 overlay 导出。
+- 每次 policy 推理步都会打印动作：`[policy] infer step=... action=...`。
+- 对齐真实部署脚本行为：当 `config.deploy.vis=True` 时，在 policy 推理步弹出 Open3D 3D 点云 + 预测 TCP 可视化窗口；
+  关闭窗口并回车后才继续下一步。
 
 ### 追加修复（2026-03-15，首帧标注改到 rise2 侧）
 

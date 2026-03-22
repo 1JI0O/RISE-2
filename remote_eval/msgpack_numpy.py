@@ -19,7 +19,8 @@ import numpy as np
 
 
 def pack_array(obj):
-    if (isinstance(obj, np.ndarray | np.generic)) and obj.dtype.kind in ("V", "O", "c"):
+    # Python 3.8 不支持 `np.ndarray | np.generic` 这种联合类型写法
+    if (isinstance(obj, (np.ndarray, np.generic))) and obj.dtype.kind in ("V", "O", "c"):
         raise ValueError(f"Unsupported dtype: {obj.dtype}")
 
     if isinstance(obj, np.ndarray):

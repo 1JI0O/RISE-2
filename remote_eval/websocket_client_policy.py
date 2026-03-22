@@ -19,7 +19,7 @@ class WebsocketClientPolicy:
     def get_server_metadata(self) -> dict:
         return self._server_metadata
 
-    def _wait_for_server(self) -> tuple[websockets.sync.client.ClientConnection, dict]:
+    def _wait_for_server(self):
         logging.info(f"Waiting for server at {self._uri}...")
         while True:
             try:

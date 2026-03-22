@@ -12,7 +12,7 @@ from easydict import EasyDict as edict
 from utils.training import set_seed
 from utils.ensemble import EnsembleBuffer
 # from remote_eval import WebsocketClientPolicy
-from eval_agent import SingleArmAgent, DualArmAgent
+# from eval_agent import SingleArmAgent, DualArmAgent
 from dataset.data_utils import resize_image, ImageProcessor
 from dataset.projector import SingleArmProjector, DualArmProjector
 
@@ -24,6 +24,7 @@ import cv2
 
 test_color = "/data/haoxiang/data/airexo2/task_0013/train/scene_0001/cam_105422061350/color/1737546126606.png"
 test_depth = "/data/haoxiang/data/airexo2/task_0013/train/scene_0001/cam_105422061350/depth/1737546126606.png"
+test_mask = None  # 例如: "/path/to/mask.png"
 
 fake_intrinsics = np.array([
     [912.4466 ,   0.     , 633.4127 ],
@@ -45,6 +46,9 @@ default_args = edict({
     "ckpt": "logs/collect_toys",
     "host": "127.0.0.1",
     "port": 8000,
+    "rgb": None,
+    "depth": None,
+    "mask": None,
 })
 
 
@@ -124,8 +128,6 @@ def _log_mask_fallback(step, reason, action):
 
 # ── 模块级 renderer 引用，由 evaluate() 在启动时初始化 ──
 _arm_renderer = None
-_MASK_STREAM_WINDOW_NAME = "mask_overlay_stream"
-_mask_vis_disabled = False
 
 
 def get_arm_joints(agent):
@@ -262,20 +264,21 @@ def _safe_infer_mask(color, depth, proprio, meta, mask_cfg, agent = None):
 
 
 
-def _show_mask_visualization_stream(colors, mask01, step, config):
-    if mask01 is None:
+def _save_mask_visualization(colors, raw_mask, step, config):
+    if raw_mask is None:
         return
 
-    global _mask_vis_disabled
-    if _mask_vis_disabled:
-        return
+    vis_save_dir = getattr(config.deploy, "vis_save_dir", ".")
+    if vis_save_dir is None or len(str(vis_save_dir).strip()) == 0:
+        vis_save_dir = "."
+    os.makedirs(vis_save_dir, exist_ok = True)
 
-    window_name = getattr(config.deploy, "vis_window_name", _MASK_STREAM_WINDOW_NAME)
-    if window_name is None or len(str(window_name).strip()) == 0:
-        window_name = _MASK_STREAM_WINDOW_NAME
-    window_name = str(window_name)
+    vis_save_prefix = getattr(config.deploy, "vis_save_prefix", "vis_debug")
+    if vis_save_prefix is None or len(str(vis_save_prefix).strip()) == 0:
+        vis_save_prefix = "vis_debug"
+    vis_save_prefix = str(vis_save_prefix)
 
-    mask_np = np.asarray(mask01)
+    mask_np = np.asarray(raw_mask)
     if mask_np.ndim == 3:
         mask_np = mask_np[..., 0]
     mask_u8 = ((mask_np > 0).astype(np.uint8) * 255)
@@ -287,39 +290,39 @@ def _show_mask_visualization_stream(colors, mask01, step, config):
         overlay_f32[mask_bool] = 0.6 * overlay_f32[mask_bool] + 0.4 * np.array([255.0, 0.0, 0.0], dtype = np.float32)
         overlay = np.clip(overlay_f32, 0, 255).astype(np.uint8)
 
-    overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
-    cv2.putText(
-        overlay_bgr,
-        f"step: {step}",
-        (20, 36),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1.0,
-        (0, 255, 0),
-        2,
-        cv2.LINE_AA,
-    )
+    mask_path = os.path.join(vis_save_dir, "{}_step_{:06d}_mask.png".format(vis_save_prefix, step))
+    overlay_path = os.path.join(vis_save_dir, "{}_step_{:06d}_mask_overlay.png".format(vis_save_prefix, step))
+    cv2.imwrite(mask_path, mask_u8)
+    cv2.imwrite(overlay_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+    print("[vis] saved mask: {}".format(mask_path))
+    print("[vis] saved mask overlay: {}".format(overlay_path))
 
+
+def _show_mask_visualization_popup(colors, raw_mask, step):
+    if raw_mask is None:
+        return
+
+    mask_np = np.asarray(raw_mask)
+    if mask_np.ndim == 3:
+        mask_np = mask_np[..., 0]
+    mask_u8 = ((mask_np > 0).astype(np.uint8) * 255)
+
+    overlay = np.asarray(colors, dtype = np.uint8).copy()
+    mask_bool = mask_u8 > 0
+    if np.any(mask_bool):
+        overlay_f32 = overlay.astype(np.float32)
+        overlay_f32[mask_bool] = 0.6 * overlay_f32[mask_bool] + 0.4 * np.array([255.0, 0.0, 0.0], dtype = np.float32)
+        overlay = np.clip(overlay_f32, 0, 255).astype(np.uint8)
+
+    win_name = "mask_overlay_step_{:06d}".format(step)
     try:
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-
-        # 窗口大小可配：优先固定宽高，其次按比例放大原图
-        win_w = getattr(config.deploy, "vis_window_width", None)
-        win_h = getattr(config.deploy, "vis_window_height", None)
-        if win_w is not None and win_h is not None:
-            win_w = int(win_w)
-            win_h = int(win_h)
-        else:
-            scale = float(getattr(config.deploy, "vis_window_scale", 1.5))
-            h, w = overlay_bgr.shape[:2]
-            win_w = max(1, int(w * scale))
-            win_h = max(1, int(h * scale))
-
-        cv2.resizeWindow(window_name, win_w, win_h)
-        cv2.imshow(window_name, overlay_bgr)
-        cv2.waitKey(1)
+        cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+        cv2.imshow(win_name, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+        print("[vis] showing mask overlay popup, press any key to continue ...")
+        cv2.waitKey(0)
+        cv2.destroyWindow(win_name)
     except cv2.error as exc:
-        _mask_vis_disabled = True
-        print(f"[vis] OpenCV stream visualization disabled: {exc}")
+        print(f"[vis] OpenCV popup failed: {exc}")
 
 
 def _build_image_mask_weight(mask01, image_processor):
@@ -339,112 +342,6 @@ def _build_image_mask_weight(mask01, image_processor):
     return image_mask_weight
 
 
-def _format_step_action_for_save(step_action, action_dim):
-    # 将 step_action 规整到定长向量；无动作时使用 NaN 占位
-    action_dim = int(action_dim)
-    save_action = np.full((action_dim,), np.nan, dtype = np.float32)
-
-    if step_action is None:
-        return save_action
-
-    try:
-        action_np = np.asarray(step_action, dtype = np.float32).reshape(-1)
-    except Exception:
-        return save_action
-
-    if action_np.size <= 0:
-        return save_action
-
-    copy_n = min(action_dim, int(action_np.size))
-    save_action[:copy_n] = action_np[:copy_n]
-    if int(action_np.size) != action_dim:
-        print(
-            f"[save] action dim mismatch at runtime: got={int(action_np.size)} expected={action_dim}, "
-            f"truncate_or_pad_to={action_dim}"
-        )
-    return save_action
-
-
-
-def _format_mask_u8_for_save(mask01, depth_shape):
-    # 将 mask 统一为 uint8 0/255；若无 mask 则返回全零图
-    h, w = int(depth_shape[0]), int(depth_shape[1])
-    if mask01 is None:
-        return np.zeros((h, w), dtype = np.uint8)
-
-    mask_np = np.asarray(mask01)
-    if mask_np.ndim == 3:
-        if mask_np.shape[0] == 1:
-            mask_np = mask_np[0]
-        elif mask_np.shape[-1] == 1:
-            mask_np = mask_np[..., 0]
-        else:
-            mask_np = mask_np[..., 0]
-    if mask_np.shape[:2] != (h, w):
-        mask_np = cv2.resize(
-            mask_np.astype(np.float32),
-            (w, h),
-            interpolation = cv2.INTER_NEAREST,
-        )
-    return ((mask_np > 0.5).astype(np.uint8) * 255)
-
-
-
-def _save_step_observation_action(
-    colors,
-    depths,
-    mask01,
-    step_action,
-    step,
-    rgb_dir,
-    depth_dir,
-    mask_dir,
-    action_dir,
-    action_dim,
-):
-    # 保存每个 step 的 RGB、深度、mask 与对应动作向量
-    rgb_path = os.path.join(rgb_dir, f"step_{int(step):06d}.png")
-    depth_path = os.path.join(depth_dir, f"step_{int(step):06d}.png")
-    mask_path = os.path.join(mask_dir, f"step_{int(step):06d}.png")
-    action_path = os.path.join(action_dir, f"step_{int(step):06d}.npy")
-
-    try:
-        colors_u8 = np.asarray(colors, dtype = np.uint8)
-        if colors_u8.ndim == 3 and colors_u8.shape[-1] == 3:
-            rgb_bgr = cv2.cvtColor(colors_u8, cv2.COLOR_RGB2BGR)
-        else:
-            rgb_bgr = colors_u8
-        if not cv2.imwrite(rgb_path, rgb_bgr):
-            print(f"[save] failed to write rgb image: {rgb_path}")
-    except Exception as exc:
-        print(f"[save] failed to save rgb at step={step}: {exc}")
-
-    try:
-        depth_np = np.asarray(depths)
-        if np.issubdtype(depth_np.dtype, np.integer):
-            depth_u16 = depth_np.astype(np.uint16)
-        else:
-            depth_u16 = np.clip(np.rint(depth_np), 0, np.iinfo(np.uint16).max).astype(np.uint16)
-        if not cv2.imwrite(depth_path, depth_u16):
-            print(f"[save] failed to write depth image: {depth_path}")
-    except Exception as exc:
-        print(f"[save] failed to save depth at step={step}: {exc}")
-
-    try:
-        mask_u8 = _format_mask_u8_for_save(mask01, depth_np.shape[:2])
-        if not cv2.imwrite(mask_path, mask_u8):
-            print(f"[save] failed to write mask image: {mask_path}")
-    except Exception as exc:
-        print(f"[save] failed to save mask at step={step}: {exc}")
-
-    try:
-        action_np = _format_step_action_for_save(step_action, action_dim)
-        np.save(action_path, action_np, allow_pickle = False)
-    except Exception as exc:
-        print(f"[save] failed to save action at step={step}: {exc}")
-
-
-
 def load_test_obs(color_path, depth_path):
     # 1. 加载彩色图并转为 RGB (OpenCV 默认读入是 BGR)
     color_image = cv2.imread(color_path)
@@ -457,11 +354,39 @@ def load_test_obs(color_path, depth_path):
     depth_image = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
     if depth_image is None:
         raise ValueError(f"无法加载深度图: {depth_path}")
-    
+
     # 确保是 uint16。如果你的 PNG 是 8bit 的，需要根据量化比例转回 uint16 (通常单位是毫米)
     depth_image = depth_image.astype(np.uint16)
 
     return color_image, depth_image
+
+
+def load_test_mask(mask_path):
+    # 读取单通道 mask，支持 0/255 或任意灰度阈值图
+    mask = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+    if mask is None:
+        raise ValueError(f"无法加载 mask: {mask_path}")
+
+    if mask.ndim == 3:
+        mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+
+    return np.asarray(mask)
+
+
+class DebugInputAgent:
+    """调试模式下的一帧伪造观测 Agent。"""
+
+    def __init__(self, color_image, depth_image, intrinsics, depth_scale):
+        self._color = np.asarray(color_image, dtype = np.uint8)
+        self._depth = np.asarray(depth_image, dtype = np.uint16)
+        self.intrinsics = np.asarray(intrinsics, dtype = np.float32)
+        self.camera = edict({"depth_scale": float(depth_scale)})
+
+    def get_global_observation(self):
+        return self._color.copy(), self._depth.copy()
+
+    def stop(self):
+        pass
 
 
 def create_point_cloud(colors, depths, intrinsics, config, depth_scale = 1000.0, rescale_factor = 1):
@@ -610,9 +535,37 @@ def evaluate(args_override):
         print("Connecting to remote server ...")
         policy = WebsocketClientPolicy(host = args.host, port = args.port)
 
-    # projector
-    Projector = SingleArmProjector if config.robot_type == "single" else DualArmProjector
-    projector = Projector(args.calib_rise2, config.deploy.agent.camera_serial)
+    # debug 输入模式：传入 rgb/depth/mask，伪造单帧观测用于离线推理
+    debug_input_mode = bool((args.rgb is not None) or (args.depth is not None) or (args.mask is not None))
+    debug_mask_raw = None
+    if debug_input_mode:
+        debug_rgb_path = args.rgb if args.rgb is not None else test_color
+        debug_depth_path = args.depth if args.depth is not None else test_depth
+        debug_mask_path = args.mask if args.mask is not None else test_mask
+
+        print(f"[debug] loading rgb: {debug_rgb_path}")
+        print(f"[debug] loading depth: {debug_depth_path}")
+        debug_color_image, debug_depth_image = load_test_obs(debug_rgb_path, debug_depth_path)
+
+        if debug_mask_path is not None and len(str(debug_mask_path).strip()) > 0:
+            print(f"[debug] loading mask: {debug_mask_path}")
+            debug_mask_raw = load_test_mask(debug_mask_path)
+        else:
+            print("[debug] mask not provided, fall back to infer/no-mask path")
+
+    # debug 模式可不传 calib_airexo；非 debug 仍需按原流程提供
+    if debug_input_mode:
+        if args.calib_airexo is None or len(str(args.calib_airexo).strip()) == 0:
+            print("[debug] calib_airexo not provided, skip airexo calibration (external mask mode)")
+    elif args.type == "local" and bool(config.mask_aware.enabled):
+        if args.calib_airexo is None or len(str(args.calib_airexo).strip()) == 0:
+            raise ValueError("--calib_airexo is required in non-debug local mask-aware mode")
+
+    # projector（debug 单帧模式下不投影到 base，直接可视化模型输出 action）
+    projector = None
+    if not debug_input_mode:
+        Projector = SingleArmProjector if config.robot_type == "single" else DualArmProjector
+        projector = Projector(args.calib_rise2, config.deploy.agent.camera_serial)
 
     # image processor
     image_enc = config.model.image_enc
@@ -637,26 +590,19 @@ def evaluate(args_override):
     )
 
     # evaluation
-    Agent = SingleArmAgent if config.robot_type == "single" else DualArmAgent
-    agent = Agent(**config.deploy.agent)
+    if debug_input_mode:
+        agent = DebugInputAgent(
+            color_image = debug_color_image,
+            depth_image = debug_depth_image,
+            intrinsics = fake_intrinsics,
+            depth_scale = fake_depth_scale,
+        )
+    else:
+        Agent = SingleArmAgent if config.robot_type == "single" else DualArmAgent
+        agent = Agent(**config.deploy.agent)
 
     # ensemble buffer
     ensemble_buffer = EnsembleBuffer(mode = config.deploy.ensemble_mode)
-
-    # 每步保存观测与动作（目录固定为仓库下 visdebug）
-    save_root = os.path.join(os.getcwd(), "visdebug")
-    os.makedirs(save_root, exist_ok = True)
-
-    rgb_save_dir = os.path.join(save_root, "rgb")
-    depth_save_dir = os.path.join(save_root, "depth")
-    mask_save_dir = os.path.join(save_root, "mask")
-    action_save_dir = os.path.join(save_root, "actions")
-    os.makedirs(rgb_save_dir, exist_ok = True)
-    os.makedirs(depth_save_dir, exist_ok = True)
-    os.makedirs(mask_save_dir, exist_ok = True)
-    os.makedirs(action_save_dir, exist_ok = True)
-    action_dim_for_save = 10 if config.robot_type == "single" else 20
-    print(f"[save] per-step rgb/depth/mask/action saving enabled: {save_root}")
 
     # 输出 mask-aware 配置摘要
     _log_mask_aware_summary(config.mask_aware)
@@ -664,7 +610,7 @@ def evaluate(args_override):
     # 初始化 URDF renderer（仅本地 mask-aware 模式）
     global _arm_renderer
     _arm_renderer = None
-    if config.mask_aware.enabled and args.type == "local":
+    if (not debug_input_mode) and config.mask_aware.enabled and args.type == "local":
         try:
             from mask.renderer import ArmOnlyRobotRenderer
             from airexo.calibration.calib_info import CalibrationInfo
@@ -703,45 +649,44 @@ def evaluate(args_override):
     }
 
     # evaluation rollout
-    print("Ready for rollout. Press Enter to continue...")
-    input()
-    
-    last_vis_colors = None
-    last_vis_mask01 = None
+    do_vis = bool(getattr(config.deploy, "vis", False) or debug_input_mode)
+    total_steps = 1 if debug_input_mode else config.deploy.max_steps
+
+    if debug_input_mode:
+        print("Ready for single-frame debug rollout ...")
+    else:
+        print("Ready for rollout. Press Enter to continue...")
+        input()
 
     with torch.inference_mode():
-        for t in range(config.deploy.max_steps):
-            mask_enabled = bool(config.mask_aware.enabled and args.type == "local")
-            step_colors_for_save = None
-            step_depths_for_save = None
-            step_mask01_for_save = None
-
+        for t in range(total_steps):
             if t % config.deploy.num_inference_steps == 0:
                 # pre-process inputs
                 colors, depths = agent.get_global_observation()
-                step_colors_for_save = np.asarray(colors, dtype = np.uint8).copy()
-                step_depths_for_save = np.asarray(depths).copy()
 
                 # 本地推理启用 mask-aware 分支
+                mask_enabled = bool((debug_mask_raw is not None) or (config.mask_aware.enabled and args.type == "local"))
                 mask01, mask_reason, raw_mask = None, None, None
                 if mask_enabled:
-                    mask01, mask_reason, raw_mask = _safe_infer_mask(
-                        color = colors,
-                        depth = depths,
-                        proprio = None,
-                        meta = {"step": t, "mode": args.type},
-                        mask_cfg = config.mask_aware,
-                        agent = agent,
-                    )
-                    # 无论 mask 是否可用，都刷新当前画面，避免窗口图像卡住
-                    last_vis_colors = np.asarray(colors, dtype = np.uint8).copy()
-                    if mask01 is not None:
-                        last_vis_mask01 = np.asarray(mask01, dtype = np.float32).copy()
-                        step_mask01_for_save = last_vis_mask01.copy()
-                    elif last_vis_mask01 is None:
-                        # 首次失败时用空 mask，保证也能刷新到新画面
-                        last_vis_mask01 = np.zeros(depths.shape[:2], dtype = np.float32)
+                    if debug_mask_raw is not None:
+                        raw_mask = debug_mask_raw
+                        try:
+                            mask01 = _normalize_mask01(raw_mask, depths.shape[:2], config.mask_aware)
+                        except Exception:
+                            mask01 = None
+                            mask_reason = "mask_invalid"
+                    else:
+                        mask01, mask_reason, raw_mask = _safe_infer_mask(
+                            color = colors,
+                            depth = depths,
+                            proprio = None,
+                            meta = {"step": t, "mode": args.type},
+                            mask_cfg = config.mask_aware,
+                            agent = agent,
+                        )
 
+                    if (not debug_input_mode) and do_vis and raw_mask is not None:
+                        _save_mask_visualization(colors, raw_mask, t, config)
                     if mask01 is None:
                         reason = mask_reason or "unknown_infer_failure"
                         if reason in mask_stats:
@@ -852,106 +797,78 @@ def evaluate(args_override):
                 action = process_state(pred_raw_action, config, to_control = True)
 
                 # visualization
-                if config.deploy.vis:
-                    tcp_vis_list = []
-                    for raw_tcp in action:
-                        tcp_vis = o3d.geometry.TriangleMesh.create_sphere(0.01).translate(raw_tcp[:3])
-                        tcp_vis_list.append(tcp_vis)
-                        if config.robot_type == "dual":
-                            tcp_vis_r = o3d.geometry.TriangleMesh.create_sphere(0.01).translate(raw_tcp[10:13])
-                            tcp_vis_list.append(tcp_vis_r)
-                    o3d.visualization.draw_geometries([cloud, *tcp_vis_list])
-                    input("press enter")
-                
-                # project action to base coordinate
-                if config.robot_type == "single":
-                    action_tcp = projector.project_tcp_to_base_coord(action[..., :9], rotation_rep = "rotation_6d")
-                    action = np.concatenate([action_tcp, action[..., 9:10]], axis = -1)
-                else:
-                    action_left_tcp = projector.project_tcp_to_base_coord(action[..., :9], "left", rotation_rep = "rotation_6d")
-                    action_right_tcp = projector.project_tcp_to_base_coord(action[..., 10:19], "right", rotation_rep = "rotation_6d")
-                    action = np.concatenate([action_left_tcp, action[..., 9:10], action_right_tcp, action[..., 19:20]], axis = -1)
+                if do_vis:
+                    if debug_input_mode:
+                        tcp_vis_list = []
+                        for raw_tcp in action:
+                            tcp_vis = o3d.geometry.TriangleMesh.create_sphere(0.01).translate(raw_tcp[:3])
+                            tcp_vis_list.append(tcp_vis)
+                            if config.robot_type == "dual":
+                                tcp_vis_r = o3d.geometry.TriangleMesh.create_sphere(0.01).translate(raw_tcp[10:13])
+                                tcp_vis_list.append(tcp_vis_r)
+                        o3d.visualization.draw_geometries([cloud, *tcp_vis_list])
+                    else:
+                        tcp_points = []
+                        for raw_tcp in action:
+                            tcp_points.append(raw_tcp[:3])
+                            if config.robot_type == "dual":
+                                tcp_points.append(raw_tcp[10:13])
+
+                        tcp_vis_list = []
+                        if len(tcp_points) > 0:
+                            tcp_points = np.asarray(tcp_points, dtype = np.float64).reshape(-1, 3)
+                            tcp_cloud = o3d.geometry.PointCloud()
+                            tcp_cloud.points = o3d.utility.Vector3dVector(tcp_points)
+                            tcp_cloud.paint_uniform_color([1.0, 1.0, 0.0])
+                            tcp_vis_list.append(tcp_cloud)
+
+                        vis_save_dir = getattr(config.deploy, "vis_save_dir", ".")
+                        if vis_save_dir is None or len(str(vis_save_dir).strip()) == 0:
+                            vis_save_dir = "."
+                        os.makedirs(vis_save_dir, exist_ok = True)
+
+                        vis_save_prefix = getattr(config.deploy, "vis_save_prefix", "vis_debug")
+                        if vis_save_prefix is None or len(str(vis_save_prefix).strip()) == 0:
+                            vis_save_prefix = "vis_debug"
+                        vis_save_prefix = str(vis_save_prefix)
+
+                        combined_cloud = o3d.geometry.PointCloud()
+                        combined_cloud += cloud
+                        for g in tcp_vis_list:
+                            combined_cloud += g
+
+                        ply_path = os.path.join(vis_save_dir, "{}_step_{:06d}.ply".format(vis_save_prefix, t))
+                        o3d.io.write_point_cloud(ply_path, combined_cloud)
+                        print("[vis] saved ply: {}".format(ply_path))
+                        input("press enter")
+
+                # project action to base coordinate（debug 模式不投影，直接使用模型输出）
+                if not debug_input_mode:
+                    if config.robot_type == "single":
+                        action_tcp = projector.project_tcp_to_base_coord(action[..., :9], rotation_rep = "rotation_6d")
+                        action = np.concatenate([action_tcp, action[..., 9:10]], axis = -1)
+                    else:
+                        action_left_tcp = projector.project_tcp_to_base_coord(action[..., :9], "left", rotation_rep = "rotation_6d")
+                        action_right_tcp = projector.project_tcp_to_base_coord(action[..., 10:19], "right", rotation_rep = "rotation_6d")
+                        action = np.concatenate([action_left_tcp, action[..., 9:10], action_right_tcp, action[..., 19:20]], axis = -1)
                 
                 # add to ensemble buffer
                 ensemble_buffer.add_action(action, t)
             
-            # 每个 step 都刷新 mask 可视化：
-            # - 推理步使用主流程里已算好的 mask
-            # - 非推理步额外取一次观测并仅用于可视化，不影响动作预测主流程
-            if getattr(config.deploy, "vis", False) and mask_enabled:
-                if t % config.deploy.num_inference_steps != 0:
-                    try:
-                        vis_colors, vis_depths = agent.get_global_observation()
-                        vis_mask01, _, _ = _safe_infer_mask(
-                            color = vis_colors,
-                            depth = vis_depths,
-                            proprio = None,
-                            meta = {"step": t, "mode": args.type, "vis_only": True},
-                            mask_cfg = config.mask_aware,
-                            agent = agent,
-                        )
-                        # 每步都更新图像；mask 失败时沿用上一帧（若无则置空）
-                        last_vis_colors = np.asarray(vis_colors, dtype = np.uint8).copy()
-                        if step_colors_for_save is None:
-                            step_colors_for_save = last_vis_colors.copy()
-                        if step_depths_for_save is None:
-                            step_depths_for_save = np.asarray(vis_depths).copy()
-                        if vis_mask01 is not None:
-                            last_vis_mask01 = np.asarray(vis_mask01, dtype = np.float32).copy()
-                            step_mask01_for_save = last_vis_mask01.copy()
-                        elif last_vis_mask01 is None:
-                            last_vis_mask01 = np.zeros(vis_depths.shape[:2], dtype = np.float32)
-                    except Exception:
-                        # 可视化失败不影响主推理
-                        pass
-
-                if last_vis_colors is not None and last_vis_mask01 is not None:
-                    _show_mask_visualization_stream(last_vis_colors, last_vis_mask01, t, config)
-
-            if step_colors_for_save is None or step_depths_for_save is None:
-                fallback_colors, fallback_depths = agent.get_global_observation()
-                if step_colors_for_save is None:
-                    step_colors_for_save = np.asarray(fallback_colors, dtype = np.uint8).copy()
-                if step_depths_for_save is None:
-                    step_depths_for_save = np.asarray(fallback_depths).copy()
-
-                if step_mask01_for_save is None and mask_enabled:
-                    fallback_mask01, _, _ = _safe_infer_mask(
-                        color = fallback_colors,
-                        depth = fallback_depths,
-                        proprio = None,
-                        meta = {"step": t, "mode": args.type, "save_only": True},
-                        mask_cfg = config.mask_aware,
-                        agent = agent,
-                    )
-                    if fallback_mask01 is not None:
-                        step_mask01_for_save = np.asarray(fallback_mask01, dtype = np.float32).copy()
-
             # get step action from ensemble buffer
             step_action = ensemble_buffer.get_action()
             # 这个是 config.deploy.num_inference_steps 这么多次循环完成后
             # 根据 ensemble_buffer 存的一串动作加权平均得到的
             
-            # 每个 step 都保存：观测图像 + 对应动作向量（无动作时为 NaN 占位）
-            _save_step_observation_action(
-                step_colors_for_save,
-                step_depths_for_save,
-                step_mask01_for_save,
-                step_action,
-                t,
-                rgb_save_dir,
-                depth_save_dir,
-                mask_save_dir,
-                action_save_dir,
-                action_dim_for_save,
-            )
-
             if step_action is None:   # no action in the buffer => no movement.
                 continue
             
-            agent.action(step_action, rotation_rep = "rotation_6d")
-            print(f"execute {step_action}")
-            # input("enter")
+            # agent.action(step_action, rotation_rep = "rotation_6d")
+            if debug_input_mode:
+                print(f"[debug] predicted step_action: {step_action}")
+            else:
+                print(f"execute {step_action}")
+                input("enter")
 
     print(
         "[mask-aware] summary infer_none={} infer_exception={} mask_invalid={} "
@@ -966,20 +883,21 @@ def evaluate(args_override):
         )
     )
 
-    if getattr(config.deploy, "vis", False) and (not _mask_vis_disabled):
-        cv2.destroyAllWindows()
-
     agent.stop()
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--type', action = 'store', type = str, help = 'evaluation type, choices: ["local", "remote"].', required = True, choices = ["local", "remote"])
-    parser.add_argument('--calib_airexo', action = 'store', type = str, help = 'airexo calibration path', required = True)
+    parser.add_argument('--calib_airexo', action = 'store', type = str, help = 'airexo calibration path (optional in debug mode with external mask)', required = False, default = None)
     parser.add_argument('--calib_rise2', action = 'store', type = str, help = 'rise2 calibration path', required = True)
     parser.add_argument('--config', action = 'store', type = str, help = 'data and model config during training and deployment', required = True)
     parser.add_argument('--ckpt', action = 'store', type = str, help = 'checkpoint path', required = False, default = None)
     parser.add_argument('--host', action = 'store', type = str, help = 'server host address', required = False, default = "127.0.0.1")
     parser.add_argument('--port', action = 'store', type = int, help = 'server port', required = False, default = 8000)
+
+    parser.add_argument('--rgb', action = 'store', type = str, help = 'debug mode rgb image path', required = False, default = None)
+    parser.add_argument('--depth', action = 'store', type = str, help = 'debug mode depth image path', required = False, default = None)
+    parser.add_argument('--mask', action = 'store', type = str, help = 'debug mode mask image path', required = False, default = None)
 
     evaluate(vars(parser.parse_args()))

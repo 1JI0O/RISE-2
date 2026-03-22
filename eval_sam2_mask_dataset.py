@@ -1257,8 +1257,6 @@ def evaluate(args_override):
                 # dataset mode: always save overlay if --save_vis given
                 if save_vis_dir and mask01 is not None:
                     _save_mask_overlay(colors_raw, mask01, t, save_vis_dir)
-                if getattr(config.deploy, "vis", False) and mask01 is not None:
-                    _save_mask_visualization(colors_raw, mask01, t, config)
                 if mask01 is None:
                     reason = mask_reason or "unknown_infer_failure"
                     if reason in mask_stats:
@@ -1285,6 +1283,7 @@ def evaluate(args_override):
                     config         = config,
                     depth_scale    = agent.camera.depth_scale,
                     rescale_factor = 1.0,
+                    # rescale_factor = 0.5,
                 )
                 coords, points, cloud = create_input(
                     colors_raw, depths_for_cloud, **create_input_kwargs
@@ -1363,6 +1362,20 @@ def evaluate(args_override):
 
                 action = process_state(pred_raw_action, config, to_control=True)
 
+                # visualization (same behavior as real deployment script)
+                if getattr(config.deploy, "vis", False):
+                    tcp_vis_list = []
+                    for raw_tcp in action:
+                        tcp_vis = o3d.geometry.TriangleMesh.create_sphere(0.01).translate(raw_tcp[:3])
+                        tcp_vis_list.append(tcp_vis)
+                        if config.robot_type == "dual":
+                            tcp_vis_r = o3d.geometry.TriangleMesh.create_sphere(0.01).translate(raw_tcp[10:13])
+                            tcp_vis_list.append(tcp_vis_r)
+                    o3d.visualization.draw_geometries([cloud, *tcp_vis_list])
+                    # input("press enter")
+
+                print(f"[policy] infer step={t} action={action}")
+
                 # projector: skipped in dataset mode
                 if projector is not None:
                     if config.robot_type == "single":
@@ -1389,8 +1402,7 @@ def evaluate(args_override):
             if step_action is None:
                 continue
             agent.action(step_action, rotation_rep="rotation_6d")
-            if not dataset_mode:
-                print(f"execute {step_action}")
+            print(f"execute {step_action}")
 
     print(
         "[mask-aware] summary infer_none={} infer_exception={} mask_invalid={} "

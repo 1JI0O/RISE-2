@@ -1,5 +1,4 @@
 import os
-import sys
 import yaml
 import torch
 import argparse
@@ -19,15 +18,26 @@ from dataset.projector import SingleArmProjector, DualArmProjector
 
 from collections import OrderedDict
 
-# Remove project root from sys.path before importing sam2 to prevent the local
-# sam2/ subdirectory from shadowing the installed sam2 package.
-_project_root = os.path.dirname(os.path.abspath(__file__))
-_removed = _project_root in sys.path
-if _removed:
-    sys.path.remove(_project_root)
-from sam2.build_sam import build_sam2_video_predictor
-if _removed:
-    sys.path.insert(0, _project_root)
+
+def _import_build_sam2_video_predictor():
+    """Lazy import for local SAM2 mode only.
+
+    Keep project root out of sys.path during import so local sam2/ source tree
+    does not shadow the installed SAM2 package.
+    """
+    import sys
+
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    removed = project_root in sys.path
+    if removed:
+        sys.path.remove(project_root)
+    try:
+        from sam2.build_sam import build_sam2_video_predictor as _builder
+    finally:
+        if removed:
+            sys.path.insert(0, project_root)
+    return _builder
+
 
 import cv2
 
@@ -148,7 +158,8 @@ def _build_sam2_cfg(mask_aware_cfg):
         "gripper_obj_id": 2,
         "dilate_radius": 10,
         "reset_every_n_steps": 100,  # 控制步数（现在每步都有一帧观测 = 连续视频帧）
-        "remote_port": None,         # 若设置（如 8765），走 WebSocket 模式；None = 本地模式
+        "remote_host": "127.0.0.1", # SAM2 远程服务地址
+        "remote_port": None,          # 若设置（如 8765），走 WebSocket 模式；None = 本地模式
     }
 
     raw_cfg = getattr(mask_aware_cfg, "sam2", {})
@@ -168,6 +179,7 @@ def _build_sam2_cfg(mask_aware_cfg):
         merged_cfg["gripper_obj_id"] = int(merged_cfg["gripper_obj_id"])
         merged_cfg["dilate_radius"] = int(merged_cfg["dilate_radius"])
         merged_cfg["reset_every_n_steps"] = int(merged_cfg["reset_every_n_steps"])
+        merged_cfg["remote_host"] = str(merged_cfg["remote_host"])
         if merged_cfg["remote_port"] is not None:
             merged_cfg["remote_port"] = int(merged_cfg["remote_port"])
     except Exception as exc:
@@ -181,7 +193,8 @@ def _build_sam2_cfg(mask_aware_cfg):
 def _log_sam2_summary(sam2_cfg):
     print(
         "[mask-aware/sam2] enabled={} cfg={} ckpt={} device={} "
-        "arm_obj_id={} gripper_obj_id={} dilate_radius={} reset_every_n_steps={}".format(
+        "arm_obj_id={} gripper_obj_id={} dilate_radius={} reset_every_n_steps={} "
+        "remote_host={} remote_port={}".format(
             sam2_cfg.enabled,
             sam2_cfg.config_file,
             sam2_cfg.ckpt_path,
@@ -190,6 +203,8 @@ def _log_sam2_summary(sam2_cfg):
             sam2_cfg.gripper_obj_id,
             sam2_cfg.dilate_radius,
             sam2_cfg.reset_every_n_steps,
+            sam2_cfg.remote_host,
+            sam2_cfg.remote_port,
         )
     )
 
@@ -215,18 +230,41 @@ def _resolve_sam2_device(device_str):
     raise ValueError(f"unsupported sam2 device: {device_str}")
 
 
-def _init_sam2_remote_client(port):
+def _init_sam2_remote_client(host, port):
     """Connect to sam2_mask_server running in the sam2 conda environment."""
     import time
     import websockets.sync.client
     from remote_eval import msgpack_numpy as _mnp
 
-    uri = f"ws://127.0.0.1:{port}"
+    uri = f"ws://{host}:{port}"
     packer = _mnp.Packer()
+
+    def _connect_once():
+        # 对齐 dataset 侧逻辑：优先尝试 proxy=None，若底层不兼容再回退。
+        try:
+            return websockets.sync.client.connect(
+                uri,
+                compression=None,
+                max_size=None,
+                proxy=None,
+            )
+        except TypeError:
+            # 兼容旧版或部分实现：不支持/不接受 proxy 参数
+            return websockets.sync.client.connect(uri, compression=None, max_size=None)
+
     while True:
         try:
-            conn = websockets.sync.client.connect(uri, compression=None, max_size=None)
-            _mnp.unpackb(conn.recv())   # wait for {"status": "ready"} handshake
+            conn = _connect_once()
+            try:
+                ready = _mnp.unpackb(conn.recv())
+            except Exception:
+                conn.close()
+                raise
+
+            if not isinstance(ready, dict) or ready.get("status") != "ready":
+                conn.close()
+                raise RuntimeError(f"unexpected SAM2 server handshake payload: {ready!r}")
+
             print(f"[mask-aware/sam2] connected to remote server at {uri}")
             return {
                 "mode":             "remote",
@@ -234,16 +272,26 @@ def _init_sam2_remote_client(port):
                 "conn":             conn,
                 "packer":           packer,
                 "last_fail_reason": None,
+                "cold_started":     False,
             }
         except ConnectionRefusedError:
             print(f"[mask-aware/sam2] waiting for sam2 server on port {port}...")
+            time.sleep(2)
+        except Exception as exc:
+            print(
+                f"[mask-aware/sam2] connect failed ({type(exc).__name__}): {exc}; retrying..."
+            )
             time.sleep(2)
 
 
 def _init_sam2_runtime(sam2_cfg):
     if getattr(sam2_cfg, "remote_port", None) is not None:
-        return _init_sam2_remote_client(sam2_cfg.remote_port)
+        host = getattr(sam2_cfg, "remote_host", "127.0.0.1")
+        runtime = _init_sam2_remote_client(host, sam2_cfg.remote_port)
+        runtime["cfg"] = sam2_cfg
+        return runtime
 
+    build_sam2_video_predictor = _import_build_sam2_video_predictor()
     device = _resolve_sam2_device(sam2_cfg.device)
     predictor = build_sam2_video_predictor(
         config_file=sam2_cfg.config_file,
@@ -477,6 +525,143 @@ def _compute_final_mask(arm_raw, gripper_raw, dilate_radius):
     return arm_dilated
 
 
+def _remote_sam2_rpc(payload):
+    from remote_eval import msgpack_numpy as _mnp
+
+    global _sam2_runtime
+    _sam2_runtime["conn"].send(_sam2_runtime["packer"].pack(payload))
+    resp = _mnp.unpackb(_sam2_runtime["conn"].recv())
+    if not isinstance(resp, dict):
+        raise RuntimeError(f"unexpected remote response type: {type(resp)}")
+    return resp
+
+
+
+def _remote_cold_start_interactive(color_np):
+    """Remote SAM2 cold start with local UI (popup on rise2 side)."""
+    global _sam2_runtime
+    cfg = _sam2_runtime["cfg"]
+
+    ARM_OBJ_ID    = int(cfg.arm_obj_id)
+    GRP_OBJ_ID    = int(cfg.gripper_obj_id)
+    ARM_COLOR_BGR = (0, 120, 220)
+    GRP_COLOR_BGR = (0, 140, 255)
+    WIN = "SAM2 Cold Start  [a]=ARM [g]=GRIPPER [r]=Reset [Enter/Space]=Done [ESC]=Abort"
+
+    state = {
+        "active_obj": ARM_OBJ_ID,
+        "points":     {ARM_OBJ_ID: [], GRP_OBJ_ID: []},
+        "labels":     {ARM_OBJ_ID: [], GRP_OBJ_ID: []},
+        "masks":      {ARM_OBJ_ID: None, GRP_OBJ_ID: None},
+    }
+
+    def _pack_points_labels():
+        return {
+            "points": {
+                "arm": state["points"][ARM_OBJ_ID],
+                "gripper": state["points"][GRP_OBJ_ID],
+            },
+            "labels": {
+                "arm": state["labels"][ARM_OBJ_ID],
+                "gripper": state["labels"][GRP_OBJ_ID],
+            },
+        }
+
+    def _refresh_masks():
+        payload = {
+            "op": "cold_start_preview",
+            "color": color_np,
+            **_pack_points_labels(),
+        }
+        resp = _remote_sam2_rpc(payload)
+        _sam2_runtime["last_fail_reason"] = resp.get("reason")
+
+        arm_m = resp.get("arm_mask")
+        grp_m = resp.get("gripper_mask")
+        state["masks"][ARM_OBJ_ID] = (np.asarray(arm_m) > 0) if arm_m is not None else None
+        state["masks"][GRP_OBJ_ID] = (np.asarray(grp_m) > 0) if grp_m is not None else None
+
+    def _render():
+        disp = color_np.copy().astype(np.float32)
+        for oid, bgr in [(ARM_OBJ_ID, ARM_COLOR_BGR), (GRP_OBJ_ID, GRP_COLOR_BGR)]:
+            m = state["masks"][oid]
+            if m is not None:
+                c_rgb = np.array([bgr[2], bgr[1], bgr[0]], dtype=np.float32)
+                disp[m] = disp[m] * 0.55 + c_rgb * 0.45
+        disp = np.clip(disp, 0, 255).astype(np.uint8)
+        for oid, bgr in [(ARM_OBJ_ID, ARM_COLOR_BGR), (GRP_OBJ_ID, GRP_COLOR_BGR)]:
+            for (x, y), lbl in zip(state["points"][oid], state["labels"][oid]):
+                marker = cv2.MARKER_STAR if lbl == 1 else cv2.MARKER_CROSS
+                cv2.drawMarker(disp, (int(x), int(y)), bgr, marker, 18, 2)
+        obj_name = "ARM" if state["active_obj"] == ARM_OBJ_ID else "GRIPPER"
+        cv2.putText(disp, f"Active: {obj_name}", (10, 32),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+        return cv2.cvtColor(disp, cv2.COLOR_RGB2BGR)
+
+    def on_mouse(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            state["points"][state["active_obj"]].append([x, y])
+            state["labels"][state["active_obj"]].append(1)
+            _refresh_masks()
+            cv2.imshow(WIN, _render())
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            state["points"][state["active_obj"]].append([x, y])
+            state["labels"][state["active_obj"]].append(0)
+            _refresh_masks()
+            cv2.imshow(WIN, _render())
+
+    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(WIN, on_mouse)
+    cv2.imshow(WIN, cv2.cvtColor(color_np, cv2.COLOR_RGB2BGR))
+    print("[mask-aware/sam2] Cold start (remote model): annotate arm [a] and gripper [g] on frame 0.")
+    print("  Left=positive  Right=negative  [r]=reset active obj  Enter/Space=done  ESC=abort")
+
+    while True:
+        key = cv2.waitKey(30) & 0xFF
+        if key == ord('a'):
+            state["active_obj"] = ARM_OBJ_ID
+            print(f"[cold-start] active -> ARM (obj={ARM_OBJ_ID})")
+            cv2.imshow(WIN, _render())
+        elif key == ord('g'):
+            state["active_obj"] = GRP_OBJ_ID
+            print(f"[cold-start] active -> GRIPPER (obj={GRP_OBJ_ID})")
+            cv2.imshow(WIN, _render())
+        elif key == ord('r'):
+            oid = state["active_obj"]
+            state["points"][oid].clear()
+            state["labels"][oid].clear()
+            state["masks"][oid] = None
+            _refresh_masks()
+            cv2.imshow(WIN, _render())
+            print(f"[cold-start] reset obj={oid}")
+        elif key in (13, 32):
+            cv2.destroyWindow(WIN)
+            break
+        elif key == 27:
+            cv2.destroyWindow(WIN)
+            _sam2_runtime["last_fail_reason"] = "sam2_cold_start_aborted"
+            print("[cold-start] ESC: aborting cold start")
+            return None
+
+    payload = {
+        "op": "cold_start_commit",
+        "color": color_np,
+        **_pack_points_labels(),
+    }
+    resp = _remote_sam2_rpc(payload)
+    _sam2_runtime["last_fail_reason"] = resp.get("reason")
+    mask = resp.get("mask")
+    if mask is None:
+        return None
+
+    _sam2_runtime["cold_started"] = True
+    n_arm = sum(l == 1 for l in state["labels"][ARM_OBJ_ID])
+    n_grp = sum(l == 1 for l in state["labels"][GRP_OBJ_ID])
+    print(f"[cold-start] confirmed: arm={n_arm} pos pts, gripper={n_grp} pos pts")
+    return mask
+
+
+
 def infer_mask(color, depth, proprio, meta, agent=None):
     """
     使用 SAM2VideoPredictor 在线跟踪机械臂（arm obj=1）和 gripper（obj=2）。
@@ -492,17 +677,19 @@ def infer_mask(color, depth, proprio, meta, agent=None):
     if _sam2_runtime is None or not bool(_sam2_runtime.get("enabled", False)):
         return None
 
-    # ── remote 模式：通过 WebSocket 转发给 sam2 conda 环境的服务端 ─────────────
+    # ── remote 模式：模型在 sam2 侧，首帧标注 UI 在 rise2 侧 ────────────────────
     if _sam2_runtime.get("mode") == "remote":
-        from remote_eval import msgpack_numpy as _mnp
         color_np = np.asarray(color)
         if color_np.dtype != np.uint8:
             color_np = np.clip(color_np, 0, 255).astype(np.uint8)
+
         try:
-            _sam2_runtime["conn"].send(_sam2_runtime["packer"].pack({"color": color_np}))
-            resp = _mnp.unpackb(_sam2_runtime["conn"].recv())
+            if not bool(_sam2_runtime.get("cold_started", False)):
+                return _remote_cold_start_interactive(color_np)
+
+            resp = _remote_sam2_rpc({"op": "infer", "color": color_np})
             _sam2_runtime["last_fail_reason"] = resp.get("reason")
-            return resp.get("mask")   # uint8 (H,W) 或 None
+            return resp.get("mask")
         except Exception as exc:
             _sam2_runtime["last_fail_reason"] = "sam2_remote_exception"
             print(f"[mask-aware/sam2] remote call failed: {exc}")
@@ -700,7 +887,20 @@ def _save_mask_visualization(colors, mask01, step, config):
     vis_save_dir = getattr(config.deploy, "vis_save_dir", ".")
     if vis_save_dir is None or len(str(vis_save_dir).strip()) == 0:
         vis_save_dir = "."
-    os.makedirs(vis_save_dir, exist_ok = True)
+
+    # 部署机常见权限问题：配置里是 /data/... 但当前用户无写权限。
+    # 失败时自动回退到当前工作目录下的 vis_debug，避免主流程中断。
+    try:
+        os.makedirs(vis_save_dir, exist_ok = True)
+    except Exception as exc:
+        fallback_dir = os.path.join(os.getcwd(), "vis_debug")
+        try:
+            os.makedirs(fallback_dir, exist_ok = True)
+            print(f"[vis] cannot create vis_save_dir={vis_save_dir}, fallback to {fallback_dir}: {exc}")
+            vis_save_dir = fallback_dir
+        except Exception as exc2:
+            print(f"[vis] disable save due to mkdir failure: {exc2}")
+            return
 
     vis_save_prefix = getattr(config.deploy, "vis_save_prefix", "vis_debug")
     if vis_save_prefix is None or len(str(vis_save_prefix).strip()) == 0:
@@ -721,10 +921,13 @@ def _save_mask_visualization(colors, mask01, step, config):
 
     mask_path = os.path.join(vis_save_dir, "{}_step_{:06d}_mask.png".format(vis_save_prefix, step))
     overlay_path = os.path.join(vis_save_dir, "{}_step_{:06d}_mask_overlay.png".format(vis_save_prefix, step))
-    cv2.imwrite(mask_path, mask_u8)
-    cv2.imwrite(overlay_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
-    print("[vis] saved mask: {}".format(mask_path))
-    print("[vis] saved mask overlay: {}".format(overlay_path))
+    ok1 = cv2.imwrite(mask_path, mask_u8)
+    ok2 = cv2.imwrite(overlay_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+    if ok1 and ok2:
+        print("[vis] saved mask: {}".format(mask_path))
+        print("[vis] saved mask overlay: {}".format(overlay_path))
+    else:
+        print("[vis] save failed, skip this frame")
 
 
 def _build_image_mask_weight(mask01, image_processor):
@@ -869,6 +1072,14 @@ def evaluate(args_override):
     config.mask_aware = _build_mask_aware_cfg(config)
     config.mask_aware.sam2 = _build_sam2_cfg(config.mask_aware)
 
+    # optional env override for SAM2 remote endpoint
+    sam2_remote_host_env = os.getenv("SAM2_REMOTE_HOST")
+    sam2_remote_port_env = os.getenv("SAM2_REMOTE_PORT")
+    if sam2_remote_host_env:
+        config.mask_aware.sam2.remote_host = sam2_remote_host_env
+    if sam2_remote_port_env:
+        config.mask_aware.sam2.remote_port = int(sam2_remote_port_env)
+
     # set seed
     set_seed(config.deploy.seed)
 
@@ -908,6 +1119,7 @@ def evaluate(args_override):
     else:
         # connect to remote inference service
         print("Connecting to remote server ...")
+        from remote_eval import WebsocketClientPolicy
         policy = WebsocketClientPolicy(host = args.host, port = args.port)
 
     # projector
@@ -1154,7 +1366,7 @@ def evaluate(args_override):
             if step_action is None:   # no action in the buffer => no movement.
                 continue
 
-            agent.action(step_action, rotation_rep = "rotation_6d")
+            # agent.action(step_action, rotation_rep = "rotation_6d")
             print(f"execute {step_action}")
             # input("enter")
 

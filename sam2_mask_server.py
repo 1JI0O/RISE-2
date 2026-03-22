@@ -241,9 +241,10 @@ def _compute_final_mask(arm_raw, gripper_raw, dilate_radius):
 class SAM2MaskServer:
     """WebSocket server that wraps SAM2 VideoPredictor online tracking."""
 
-    def __init__(self, cfg: dict, port: int):
+    def __init__(self, cfg: dict, host: str, port: int):
         self._cfg  = cfg
-        self._port = port
+        self._host = str(host)
+        self._port = int(port)
         self._rt   = None   # runtime dict, initialised in _setup()
         self._executor = ThreadPoolExecutor(max_workers=1)  # serial SAM2 calls
         self._setup()
@@ -513,12 +514,12 @@ class SAM2MaskServer:
     async def _run(self):
         async with websockets.asyncio.server.serve(
             self._handler,
-            "127.0.0.1",
+            self._host,
             self._port,
             compression=None,
             max_size=None,
         ) as server:
-            print(f"[sam2-server] listening on 127.0.0.1:{self._port}")
+            print(f"[sam2-server] listening on {self._host}:{self._port}")
             await server.serve_forever()
 
 
@@ -554,6 +555,8 @@ def main():
     parser = argparse.ArgumentParser(description="SAM2 mask WebSocket server")
     parser.add_argument("--config", required=True,
                         help="Path to YAML config (e.g. configs/dual_teleop_dino.yaml)")
+    parser.add_argument("--host", type=str, default="0.0.0.0",
+                        help="WebSocket bind host (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8765,
                         help="WebSocket port (default: 8765)")
     args = parser.parse_args()
@@ -561,7 +564,7 @@ def main():
     cfg = _load_sam2_cfg_from_yaml(args.config)
     print(f"[sam2-server] config: {cfg}")
 
-    server = SAM2MaskServer(cfg=cfg, port=args.port)
+    server = SAM2MaskServer(cfg=cfg, host=args.host, port=args.port)
     server.serve_forever()
 
 

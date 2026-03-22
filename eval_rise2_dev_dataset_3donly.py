@@ -661,37 +661,49 @@ def evaluate(args_override):
                 # unnormalize predicted actions
                 action = process_state(pred_raw_action, config, to_control = True)
 
+                # # visualization
+                # if config.deploy.vis:
+                #     vis_save_dir = getattr(config.deploy, "vis_save_dir", ".")
+                #     if vis_save_dir is None or len(str(vis_save_dir).strip()) == 0:
+                #         vis_save_dir = "."
+                #     os.makedirs(vis_save_dir, exist_ok = True)
+
+                #     vis_save_prefix = getattr(config.deploy, "vis_save_prefix", "vis_debug")
+                #     if vis_save_prefix is None or len(str(vis_save_prefix).strip()) == 0:
+                #         vis_save_prefix = "vis_debug"
+                #     vis_save_prefix = str(vis_save_prefix)
+
+                #     combined_cloud = o3d.geometry.PointCloud()
+                #     combined_cloud += cloud
+
+                #     tcp_points = []
+                #     for raw_tcp in action:
+                #         tcp_points.append(raw_tcp[:3])
+                #         if config.robot_type == "dual":
+                #             tcp_points.append(raw_tcp[10:13])
+
+                #     if len(tcp_points) > 0:
+                #         tcp_points = np.asarray(tcp_points, dtype = np.float64).reshape(-1, 3)
+                #         tcp_cloud = o3d.geometry.PointCloud()
+                #         tcp_cloud.points = o3d.utility.Vector3dVector(tcp_points)
+                #         tcp_cloud.paint_uniform_color([1.0, 1.0, 0.0])
+                #         combined_cloud += tcp_cloud
+
+                #     ply_path = os.path.join(vis_save_dir, "{}_step_{:06d}.ply".format(vis_save_prefix, t))
+                #     o3d.io.write_point_cloud(ply_path, combined_cloud)
+                #     print("[vis] saved ply: {}".format(ply_path))
+                #     input("press enter")
+
                 # visualization
                 if config.deploy.vis:
-                    vis_save_dir = getattr(config.deploy, "vis_save_dir", ".")
-                    if vis_save_dir is None or len(str(vis_save_dir).strip()) == 0:
-                        vis_save_dir = "."
-                    os.makedirs(vis_save_dir, exist_ok = True)
-
-                    vis_save_prefix = getattr(config.deploy, "vis_save_prefix", "vis_debug")
-                    if vis_save_prefix is None or len(str(vis_save_prefix).strip()) == 0:
-                        vis_save_prefix = "vis_debug"
-                    vis_save_prefix = str(vis_save_prefix)
-
-                    combined_cloud = o3d.geometry.PointCloud()
-                    combined_cloud += cloud
-
-                    tcp_points = []
+                    tcp_vis_list = []
                     for raw_tcp in action:
-                        tcp_points.append(raw_tcp[:3])
+                        tcp_vis = o3d.geometry.TriangleMesh.create_sphere(0.01).translate(raw_tcp[:3])
+                        tcp_vis_list.append(tcp_vis)
                         if config.robot_type == "dual":
-                            tcp_points.append(raw_tcp[10:13])
-
-                    if len(tcp_points) > 0:
-                        tcp_points = np.asarray(tcp_points, dtype = np.float64).reshape(-1, 3)
-                        tcp_cloud = o3d.geometry.PointCloud()
-                        tcp_cloud.points = o3d.utility.Vector3dVector(tcp_points)
-                        tcp_cloud.paint_uniform_color([1.0, 1.0, 0.0])
-                        combined_cloud += tcp_cloud
-
-                    ply_path = os.path.join(vis_save_dir, "{}_step_{:06d}.ply".format(vis_save_prefix, t))
-                    o3d.io.write_point_cloud(ply_path, combined_cloud)
-                    print("[vis] saved ply: {}".format(ply_path))
+                            tcp_vis_r = o3d.geometry.TriangleMesh.create_sphere(0.01).translate(raw_tcp[10:13])
+                            tcp_vis_list.append(tcp_vis_r)
+                    o3d.visualization.draw_geometries([cloud, *tcp_vis_list])
                     input("press enter")
 
                 # project action to base coordinate
