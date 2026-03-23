@@ -163,10 +163,23 @@ def vis_data(
             combined_pcd += _add_box_corners(translation_min, translation_max, [0.0, 1.0, 0.0])
 
         # yellow: action tcp trajectory points
+        # PLY 本身不支持“点大小”属性；为了让轨迹点离线看起来更大，
+        # 这里把每个轨迹点膨胀成一个很小的立方体点簇。
         if action_tcps is not None and len(action_tcps) > 0:
             action_pts = np.asarray(action_tcps)[:, :3]
+            act_radius = 0.01
+            act_offsets = np.array([
+                [0.0, 0.0, 0.0],
+                [ act_radius, 0.0, 0.0],
+                [-act_radius, 0.0, 0.0],
+                [0.0,  act_radius, 0.0],
+                [0.0, -act_radius, 0.0],
+                [0.0, 0.0,  act_radius],
+                [0.0, 0.0, -act_radius],
+            ], dtype=np.float32)
+            act_pts_big = (action_pts[:, None, :] + act_offsets[None, :, :]).reshape(-1, 3)
             act_pcd = o3d.geometry.PointCloud()
-            act_pcd.points = o3d.utility.Vector3dVector(action_pts)
+            act_pcd.points = o3d.utility.Vector3dVector(act_pts_big)
             act_pcd.paint_uniform_color([1.0, 1.0, 0.0])
             combined_pcd += act_pcd
 

@@ -89,8 +89,10 @@ class DualArmProjector:
             else:
                 self.depth_scales[cam_serial] = 1000.
 
-        self.projector_left = ProjectorBase(np.linalg.inv(self.calib_file["camera_to_robot_left"][global_cam_serial]))
-        self.projector_right = ProjectorBase(np.linalg.inv(self.calib_file["camera_to_robot_right"][global_cam_serial]))
+        # self.projector_left = ProjectorBase(np.linalg.inv(self.calib_file["camera_to_robot_left"][global_cam_serial]))
+        # self.projector_right = ProjectorBase(np.linalg.inv(self.calib_file["camera_to_robot_right"][global_cam_serial]))
+        self.projector_left = ProjectorBase(self.calib_file["camera_to_robot_left"][global_cam_serial])
+        self.projector_right = ProjectorBase(self.calib_file["camera_to_robot_right"][global_cam_serial])
 
     def project_tcp_to_camera_coord(self, tcp, robot = "left", rotation_rep = "quaternion", rotation_rep_convention = None):
         assert robot in ["left", "right"]
