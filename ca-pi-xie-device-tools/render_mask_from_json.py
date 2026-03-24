@@ -40,7 +40,8 @@
   image = renderer.render_image()   # uint8 (H, W, 3)
   depth = renderer.render_depth()   # float32 (H, W)
 
-CLI（直接运行，只需传关节角）：
+CLI（直接运行，不传关节角则使用 robot_sep.yaml 测试默认值）：
+  python render_mask_from_json.py --output mask.png --save-image render.png
   python render_mask_from_json.py \\
       --left-joints  "1.078,-2.201,1.628,-1.162,-0.958,0.503,0.875,0.05" \\
       --right-joints "1.397,-2.226,1.835,-1.367,-0.647,0.781,0.972,0.05" \\
@@ -72,21 +73,18 @@ HARDCODED_INTRINSIC = np.array([
 ], dtype=np.float32)
 
 # ---------------------------------------------------------------------------
-# 硬编码示例关节角（来自 task0012 scene_0001 第一帧 lowdim npy）
-# robot_left[:7]  + gripper_left[0]
-# robot_right[:7] + gripper_right[0]
+# 硬编码示例关节角（来自 airexo configs/tests/renderer/robot_sep.yaml）
+# 格式：[joint1..joint7 (rad), gripper_width (m)]
 # ---------------------------------------------------------------------------
 
 DEFAULT_LEFT_JOINTS = np.array([
-     0.5261577,   0.28838146, -0.18808535,
-     0.01245191, -0.0514123,   0.99847734, -0.01564565,
-     0.00014,                                             # gripper_left[0]
+     1.078, -2.201,  1.628, -1.162, -0.958, 0.503, 0.875,
+     0.05,
 ], dtype=np.float32)
 
 DEFAULT_RIGHT_JOINTS = np.array([
-     0.57887816, -0.13764569, -0.15738708,
-     0.00580126,  0.01235392,  0.999795,    0.01495556,
-     0.00015,                                             # gripper_right[0]
+     1.397, -2.226,  1.835, -1.367, -0.647, 0.781, 0.972,
+     0.05,
 ], dtype=np.float32)
 
 
@@ -471,12 +469,12 @@ def main():
     p.add_argument(
         "--left-joints", default=None,
         help="左臂关节角（弧度）+ 夹爪宽度（米），8 个逗号分隔值\n"
-             "不传则使用 DEFAULT_LEFT_JOINTS（来自 task0012 scene_0001 第一帧）",
+             "不传则使用 DEFAULT_LEFT_JOINTS（来自 robot_sep.yaml 测试值）",
     )
     p.add_argument(
         "--right-joints", default=None,
         help="右臂关节角（弧度）+ 夹爪宽度（米），8 个逗号分隔值\n"
-             "不传则使用 DEFAULT_RIGHT_JOINTS（来自 task0012 scene_0001 第一帧）",
+             "不传则使用 DEFAULT_RIGHT_JOINTS（来自 robot_sep.yaml 测试值）",
     )
     p.add_argument("--width",      type=int, default=1280)
     p.add_argument("--height",     type=int, default=720)
