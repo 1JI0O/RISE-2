@@ -19,16 +19,17 @@
   [0.0778,  0.2079, 0.3472,  qw=0.2273, qx=-0.6786, qy=0.6638, qz=-0.2175]
 
 标定矩阵处理（重要）：
-  JSON 的 pose_in_link = T_cam_individual_real_base（单臂局部 base，非 URDF base_link）
-  ROBOT_LEFT_REAL_BASE_TO_REAL_BASE = Y 方向 -135mm 平移（从局部 base 到 URDF base_link）
-  正确链条（参考 build_fake_airexo_robot_calib.py line 101）：
-    cam_to_left_base = T_cam_individual @ LEFT_REAL_BASE_TO_REAL_BASE @ inv(PREDEFINED)
+  JSON 的 pose_in_link = T_cam_individual_real_base
+  calib_info.get_camera_to_robot_{left,right}_base(real_base=False) 返回：
+    T_cam_individual_real_base @ inv(ROBOT_PREDEFINED)
+  注意：ROBOT_LEFT/RIGHT_REAL_BASE_TO_REAL_BASE (±135mm Y) 只用于 RobotRenderer 合并 base，
+  SeparateRobotRenderer 直接用 per-arm 的 individual real base，不加该偏移。
 
   展开完整渲染链条：
     O3D_RENDER
-    @ (T_cam_indiv @ LEFT_REAL_BASE_TO_REAL_BASE @ inv(PREDEFINED))
+    @ (T_cam_indiv @ inv(PREDEFINED))
     @ PREDEFINED @ LEFT_PREDEFINED @ FK @ offset
-  = O3D_RENDER @ T_cam_urdf_base @ LEFT_PREDEFINED @ FK @ offset  ← 正确
+  = O3D_RENDER @ T_cam_indiv @ LEFT_PREDEFINED @ FK @ offset
 
 使用示例
 --------
@@ -294,29 +295,20 @@ class JsonSeparateRobotRenderer:
     ):
         # ---- 标定矩阵（默认使用硬编码值） ----
         # JSON 的 pose_in_link = T_cam_individual_real_base（单臂局部 base）。
-        # build_fake_airexo_robot_calib.py 的真实链条（line 101-102）：
-        #   cam_to_left_predefined_base = T_cam_left_individual_real_base
-        #                                 @ ROBOT_LEFT_REAL_BASE_TO_REAL_BASE
-        #                                 @ inv(ROBOT_PREDEFINED)
-        # 其中 ROBOT_LEFT_REAL_BASE_TO_REAL_BASE 是 -135mm Y 方向平移，
-        # 代表单臂 individual base 到整体/URDF base_link 的偏移。
+        # calib_info.get_camera_to_robot_{left,right}_base(real_base=False) 直接返回：
+        #   T_cam_individual_real_base @ inv(ROBOT_PREDEFINED)
+        # 注意：ROBOT_LEFT/RIGHT_REAL_BASE_TO_REAL_BASE (±135mm Y) 仅用于
+        # get_camera_to_base() 合并双臂 base 供 RobotRenderer 使用，
+        # SeparateRobotRenderer 不使用它。
         _inv_predefined = np.linalg.inv(ROBOT_PREDEFINED_TRANSFORMATION)
         if cam_to_left_base is not None:
             self.cam_to_left_base = cam_to_left_base
         else:
-            self.cam_to_left_base = (
-                _pose_wxyz_to_mat(_LEFT_POSE_IN_LINK)
-                @ ROBOT_LEFT_REAL_BASE_TO_REAL_BASE
-                @ _inv_predefined
-            )
+            self.cam_to_left_base = _pose_wxyz_to_mat(_LEFT_POSE_IN_LINK) @ _inv_predefined
         if cam_to_right_base is not None:
             self.cam_to_right_base = cam_to_right_base
         else:
-            self.cam_to_right_base = (
-                _pose_wxyz_to_mat(_RIGHT_POSE_IN_LINK)
-                @ ROBOT_RIGHT_REAL_BASE_TO_REAL_BASE
-                @ _inv_predefined
-            )
+            self.cam_to_right_base = _pose_wxyz_to_mat(_RIGHT_POSE_IN_LINK) @ _inv_predefined
         intrinsic = intrinsic if intrinsic is not None else HARDCODED_INTRINSIC
         self.intrinsic   = intrinsic.astype(np.float64)
         self.width       = width
@@ -497,6 +489,7 @@ class JsonSeparateRobotRenderer:
 
         返回: (H+2*pad_y, W+2*pad_x, 3) uint8 RGB 图像
         """
+        import copy
         import cv2
 
         new_w = self.width  + 2 * pad_x
@@ -513,9 +506,9 @@ class JsonSeparateRobotRenderer:
         tmp_mat = o3d.visualization.rendering.MaterialRecord()
         tmp_mat.shader = "defaultLit"
 
-        # 将当前所有已变换的 mesh 添加到临时场景
+        # 深拷贝 mesh 防止临时渲染器析构时释放主渲染器的 GPU 资源
         for name, mesh in {**self.meshes_left, **self.meshes_right}.items():
-            tmp_renderer.scene.add_geometry(name, mesh, tmp_mat)
+            tmp_renderer.scene.add_geometry(name, copy.deepcopy(mesh), tmp_mat)
 
         tmp_renderer.scene.camera.set_projection(
             expanded_K,
