@@ -318,6 +318,11 @@ class JsonSeparateRobotRenderer:
                 @ _inv_predefined
             )
         intrinsic = intrinsic if intrinsic is not None else HARDCODED_INTRINSIC
+        self.intrinsic   = intrinsic.astype(np.float64)
+        self.width       = width
+        self.height      = height
+        self.near_plane  = near_plane
+        self.far_plane   = far_plane
 
         self.urdf_left  = left_urdf
         self.urdf_right = right_urdf
@@ -365,9 +370,9 @@ class JsonSeparateRobotRenderer:
 
         # ---- 相机投影 ----
         self.renderer.scene.camera.set_projection(
-            intrinsic.astype(np.float64),
-            near_plane, far_plane,
-            float(width), float(height),
+            self.intrinsic,
+            self.near_plane, self.far_plane,
+            float(self.width), float(self.height),
         )
 
     # ------------------------------------------------------------------
@@ -483,6 +488,54 @@ class JsonSeparateRobotRenderer:
         mask[depth < np.inf] = 255
         return mask
 
+    def render_debug_view(self, pad_x: int = 640, pad_y: int = 360) -> np.ndarray:
+        """
+        渲染扩大视角的调试图，并在其中画出原始相机 FOV 矩形框。
+
+        原理：保持焦距不变，仅向四周扩展画布（pad_x/pad_y 像素），
+        通过平移主点实现等效广角视图，无需修改场景几何体。
+
+        返回: (H+2*pad_y, W+2*pad_x, 3) uint8 RGB 图像
+        """
+        import cv2
+
+        new_w = self.width  + 2 * pad_x
+        new_h = self.height + 2 * pad_y
+
+        # 扩展内参：焦距不变，主点偏移
+        expanded_K = self.intrinsic.copy()
+        expanded_K[0, 2] += pad_x
+        expanded_K[1, 2] += pad_y
+
+        # 创建临时渲染器
+        tmp_renderer = o3d.visualization.rendering.OffscreenRenderer(new_w, new_h)
+        tmp_renderer.scene.set_background([0.2, 0.2, 0.2, 1.0])
+        tmp_mat = o3d.visualization.rendering.MaterialRecord()
+        tmp_mat.shader = "defaultLit"
+
+        # 将当前所有已变换的 mesh 添加到临时场景
+        for name, mesh in {**self.meshes_left, **self.meshes_right}.items():
+            tmp_renderer.scene.add_geometry(name, mesh, tmp_mat)
+
+        tmp_renderer.scene.camera.set_projection(
+            expanded_K,
+            self.near_plane, self.far_plane,
+            float(new_w), float(new_h),
+        )
+
+        img = np.asarray(tmp_renderer.render_to_image(), dtype=np.uint8)
+
+        # 画出原始相机 FOV 边框（绿色）
+        x0, y0 = pad_x,              pad_y
+        x1, y1 = pad_x + self.width - 1, pad_y + self.height - 1
+        cv2.rectangle(img, (x0, y0), (x1, y1), (0, 255, 0), 2)
+        # 中心十字
+        cx = int(round(self.intrinsic[0, 2])) + pad_x
+        cy = int(round(self.intrinsic[1, 2])) + pad_y
+        cv2.drawMarker(img, (cx, cy), (0, 255, 0), cv2.MARKER_CROSS, 20, 2)
+
+        return img
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -511,6 +564,12 @@ def main():
     p.add_argument("--height",     type=int, default=720)
     p.add_argument("--output",     default="mask.png", help="输出 mask 文件路径")
     p.add_argument("--save-image", default=None,       help="同时保存彩色渲染图（可选）")
+    p.add_argument(
+        "--debug-view", default=None,
+        help="保存扩大视角调试图（带 FOV 框），例如 debug.png",
+    )
+    p.add_argument("--pad-x", type=int, default=640, help="debug 视图水平扩展像素（每侧）")
+    p.add_argument("--pad-y", type=int, default=360, help="debug 视图垂直扩展像素（每侧）")
     args = p.parse_args()
 
     left_j  = _parse_floats(args.left_joints)  if args.left_joints  else DEFAULT_LEFT_JOINTS
@@ -530,6 +589,11 @@ def main():
         image = renderer.render_image()
         cv2.imwrite(args.save_image, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
         print(f"[ok] image saved: {args.save_image}")
+
+    if args.debug_view:
+        dbg = renderer.render_debug_view(pad_x=args.pad_x, pad_y=args.pad_y)
+        cv2.imwrite(args.debug_view, cv2.cvtColor(dbg, cv2.COLOR_RGB2BGR))
+        print(f"[ok] debug view saved: {args.debug_view}  (pad={args.pad_x}x{args.pad_y})")
 
 
 if __name__ == "__main__":
