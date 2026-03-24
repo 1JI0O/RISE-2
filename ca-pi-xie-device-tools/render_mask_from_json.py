@@ -18,9 +18,14 @@
 右臂 pose_in_link → T_cam_right_base:
   [0.0778,  0.2079, 0.3472,  qw=0.2273, qx=-0.6786, qy=0.6638, qz=-0.2175]
 
-渲染 transform 链（与 SeparateRobotRenderer 完全一致）：
-  左臂: O3D_RENDER @ cam_to_left_base @ ROBOT_PREDEFINED @ LEFT_ROBOT_PREDEFINED @ FK @ visual_offset
-  右臂: O3D_RENDER @ cam_to_right_base @ ROBOT_PREDEFINED @ RIGHT_ROBOT_PREDEFINED @ FK @ visual_offset
+标定矩阵处理（重要）：
+  JSON 的 pose_in_link = T_cam_real_base（real base 版本）
+  SeparateRobotRenderer 期望的 cam_to_base = T_cam_real_base @ inv(ROBOT_PREDEFINED)
+  因此内部自动右乘 inv(ROBOT_PREDEFINED)，使链条中的 ROBOT_PREDEFINED 正确抵消：
+
+  展开链条：
+    O3D_RENDER @ (T_cam_real_base @ inv(PREDEFINED)) @ PREDEFINED @ LEFT_PREDEFINED @ FK @ offset
+  = O3D_RENDER @ T_cam_real_base @ LEFT_PREDEFINED @ FK @ offset  ← 正确
 
 使用示例
 --------
@@ -270,8 +275,19 @@ class JsonSeparateRobotRenderer:
         far_plane:         float = 100.0,
     ):
         # ---- 标定矩阵（默认使用硬编码值） ----
-        self.cam_to_left_base  = cam_to_left_base  if cam_to_left_base  is not None else _pose_wxyz_to_mat(_LEFT_POSE_IN_LINK)
-        self.cam_to_right_base = cam_to_right_base if cam_to_right_base is not None else _pose_wxyz_to_mat(_RIGHT_POSE_IN_LINK)
+        # JSON 的 pose_in_link = T_cam_real_base（real base 版本）。
+        # CalibrationInfo.get_camera_to_robot_{left,right}_base() 默认 real_base=False，
+        # 返回 T_cam_real_base @ inv(ROBOT_PREDEFINED)，才是 SeparateRobotRenderer 期望的输入。
+        # 因此这里必须右乘 inv(ROBOT_PREDEFINED) 使链条中的 ROBOT_PREDEFINED 正确抵消。
+        _inv_predefined = np.linalg.inv(ROBOT_PREDEFINED_TRANSFORMATION)
+        if cam_to_left_base is not None:
+            self.cam_to_left_base = cam_to_left_base
+        else:
+            self.cam_to_left_base = _pose_wxyz_to_mat(_LEFT_POSE_IN_LINK) @ _inv_predefined
+        if cam_to_right_base is not None:
+            self.cam_to_right_base = cam_to_right_base
+        else:
+            self.cam_to_right_base = _pose_wxyz_to_mat(_RIGHT_POSE_IN_LINK) @ _inv_predefined
         intrinsic = intrinsic if intrinsic is not None else HARDCODED_INTRINSIC
 
         self.urdf_left  = left_urdf
