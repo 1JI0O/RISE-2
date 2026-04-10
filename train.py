@@ -136,6 +136,7 @@ def train(args_override):
     steps_per_epoch = len(dataloader)
 
     policy.train()
+    reached_step_limit = False
     for epoch in range(resume_epoch + 1, num_epochs):
         if RANK == 0: print("Epoch {}".format(epoch)) 
         sampler.set_epoch(epoch)
@@ -143,8 +144,12 @@ def train(args_override):
         pbar = tqdm(dataloader) if RANK == 0 else dataloader
         avg_loss = 0
         logs = ""
+        step_count_this_epoch = 0
 
         for data in pbar:
+            if cur_step >= config.train.num_steps:
+                reached_step_limit = True
+                break
             # cloud data processing
             cloud_coords = data['cloud_coords'].to(device)
             cloud_feats = data['cloud_feats'].to(device)
@@ -173,14 +178,25 @@ def train(args_override):
                 logs += "Checkpoint saved at step {}.\n".format(cur_step + 1)
             
             cur_step += 1
+            step_count_this_epoch += 1
 
-        avg_loss = avg_loss / steps_per_epoch
+        if step_count_this_epoch == 0:
+            if RANK == 0:
+                print("Reached configured training step limit, stop training loop.")
+            break
+
+        avg_loss = avg_loss / step_count_this_epoch
         sync_loss(avg_loss, device)
         train_history.append(avg_loss)
         plot_history(train_history, epoch, args.ckpt_dir, config.train.seed)
 
         logs += "# Steps: {}. Average train loss at epoch {}: {:.6f}\n".format(cur_step, epoch, avg_loss)
         if RANK == 0: print(logs)
+
+        if reached_step_limit:
+            if RANK == 0:
+                print("Reached configured training step limit, stop training loop.")
+            break
 
     if RANK == 0:
         torch.save(

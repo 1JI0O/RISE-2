@@ -1,0 +1,1386 @@
+import os
+import json
+import yaml
+import torch
+import argparse
+import numpy as np
+import open3d as o3d
+import torchvision.transforms as T
+import airexo.helpers.urdf_robot as robot_helper
+
+from copy import deepcopy
+from easydict import EasyDict as edict
+from transforms3d.quaternions import quat2mat
+
+from airexo.helpers.constants import O3D_RENDER_TRANSFORMATION, ROBOT_PREDEFINED_TRANSFORMATION
+
+from utils.training import set_seed
+from utils.ensemble import EnsembleBuffer
+# from remote_eval import WebsocketClientPolicy
+
+# from eval_agent import SingleArmAgent, DualArmAgent
+from dataset.data_utils import resize_image, ImageProcessor
+from dataset.projector import SingleArmProjector, DualArmProjector
+
+import cv2
+from PIL import Image
+
+# test_color = "/data/haoxiang/realdata_rise2_ready/train/task_0014_user_0020_scene_0001_cfg_0001/cam_104122063550/color/1765000020748.png"
+# test_depth = "/data/haoxiang/realdata_rise2_ready/train/task_0014_user_0020_scene_0001_cfg_0001/cam_104122063550/depth/1765000020748.png"
+
+
+test_color = "/data/haoxiang/data/task0012_260321/task0012_toys_basket_converted/train/scene_0001/cam_104122060902/color/1774059853130.png"
+test_depth = "/data/haoxiang/data/task0012_260321/task0012_toys_basket_converted/train/scene_0001/cam_104122060902/depth/1774059853130.png"
+
+fake_intrinsics = np.array([
+    [912.4466 ,   0.     , 633.4127 ],
+    [  0.     , 911.4704 , 364.21265],
+    [  0.     ,   0.     ,   1.     ]
+])
+
+fake_depth_scale = 1000.0
+
+test_low_dim = "/data/haoxiang/data/task0012_260321/task0012_toys_basket_converted/train/scene_0001/lowdim/1774059853130.npy"
+# lowdim npy 期望是 dict，包含 robot_left/right 和 gripper_left/right。
+
+
+def _load_test_color_depth(color_path, depth_path):
+    color = np.asarray(Image.open(color_path).convert("RGB"), dtype = np.uint8)
+    depth = np.asarray(Image.open(depth_path), dtype = np.float32)
+    return color, depth
+
+
+def _load_test_lowdim(lowdim_path):
+    data = np.load(lowdim_path, allow_pickle = True)
+    if isinstance(data, np.ndarray) and data.shape == ():
+        data = data.item()
+    if not isinstance(data, dict):
+        raise TypeError("test_low_dim must be a dict-like npy file")
+    return data
+
+
+default_args = edict({
+    "type": "local",
+    "calib_rise2": "calib_rise2/",
+    "calib_airexo": "calib_airexo/",
+    "config": "config/dual_teleop_dino.yaml",
+    "ckpt": "logs/collect_toys",
+    "host": "127.0.0.1",
+    "port": 8000,
+})
+
+
+def _build_mask_aware_cfg(config):
+    # 统一推理期 mask-aware 配置并补齐默认值
+    default_json_mask_cfg = {
+        "left_json": None,
+        "right_json": None,
+        "cam_base_mode": "base_to_cam__predef",
+        "use_agent_intrinsics": True,
+        "intrinsics_npy": None,
+        "intrinsic_selector": "first",
+        "left_urdf": os.path.join("airexo", "airexo", "urdf_models", "robot", "left_robot_inhand.urdf"),
+        "right_urdf": os.path.join("airexo", "airexo", "urdf_models", "robot", "right_robot_inhand.urdf"),
+        "width": 1280,
+        "height": 720,
+        "near_plane": 0.01,
+        "far_plane": 100.0,
+    }
+
+    default_cfg = {
+        "enabled": False,
+        "enable_3d_filter": True,
+        "enable_2d_reweight": True,
+        "mask_threshold": 0,
+        "mask_white_is_untrusted": True,
+        "r_min": 1e-3,
+        "interp_eps": 1e-6,
+        "interp_tiny": 1e-6,
+        "infer_allow_none": True,
+        "infer_none_policy": "no_mask_fallback",
+        "empty_cloud_policy": "warn_and_skip_filter",
+        "urdf": None,
+        "json_mask": default_json_mask_cfg,
+    }
+    raw_cfg = getattr(config, "mask_aware", {})
+    raw_cfg = dict(raw_cfg) if raw_cfg is not None else {}
+
+    merged_cfg = deepcopy(default_cfg)
+    for key in default_cfg:
+        if key not in raw_cfg or raw_cfg[key] is None:
+            continue
+        if key == "json_mask":
+            if isinstance(raw_cfg[key], dict):
+                json_cfg = deepcopy(default_json_mask_cfg)
+                for json_key, json_val in raw_cfg[key].items():
+                    if json_val is not None:
+                        json_cfg[json_key] = json_val
+                merged_cfg[key] = json_cfg
+        else:
+            merged_cfg[key] = raw_cfg[key]
+
+    valid_none_policy = {"no_mask_fallback", "fail_fast"}
+    valid_empty_cloud_policy = {"warn_and_skip_filter", "fail_fast"}
+    valid_cam_base_mode = {
+        "base_to_cam__predef",
+        "base_to_cam__raw",
+        "cam_to_base__predef",
+        "cam_to_base__raw",
+    }
+
+    try:
+        merged_cfg["enabled"] = bool(merged_cfg["enabled"])
+        merged_cfg["enable_3d_filter"] = bool(merged_cfg["enable_3d_filter"])
+        merged_cfg["enable_2d_reweight"] = bool(merged_cfg["enable_2d_reweight"])
+        merged_cfg["mask_threshold"] = float(merged_cfg["mask_threshold"])
+        merged_cfg["mask_white_is_untrusted"] = bool(merged_cfg["mask_white_is_untrusted"])
+        merged_cfg["r_min"] = float(merged_cfg["r_min"])
+        merged_cfg["interp_eps"] = float(merged_cfg["interp_eps"])
+        merged_cfg["interp_tiny"] = float(merged_cfg["interp_tiny"])
+        merged_cfg["infer_allow_none"] = bool(merged_cfg["infer_allow_none"])
+        merged_cfg["infer_none_policy"] = str(merged_cfg["infer_none_policy"])
+        merged_cfg["empty_cloud_policy"] = str(merged_cfg["empty_cloud_policy"])
+
+        json_cfg = deepcopy(default_json_mask_cfg)
+        if isinstance(merged_cfg.get("json_mask", {}), dict):
+            for k, v in merged_cfg["json_mask"].items():
+                if v is not None:
+                    json_cfg[k] = v
+
+        json_cfg["left_json"] = None if json_cfg["left_json"] is None else str(json_cfg["left_json"])
+        json_cfg["right_json"] = None if json_cfg["right_json"] is None else str(json_cfg["right_json"])
+        json_cfg["cam_base_mode"] = str(json_cfg["cam_base_mode"])
+        json_cfg["use_agent_intrinsics"] = bool(json_cfg["use_agent_intrinsics"])
+        json_cfg["intrinsics_npy"] = None if json_cfg["intrinsics_npy"] is None else str(json_cfg["intrinsics_npy"])
+        json_cfg["intrinsic_selector"] = str(json_cfg["intrinsic_selector"])
+        json_cfg["left_urdf"] = str(json_cfg["left_urdf"])
+        json_cfg["right_urdf"] = str(json_cfg["right_urdf"])
+        json_cfg["width"] = int(json_cfg["width"])
+        json_cfg["height"] = int(json_cfg["height"])
+        json_cfg["near_plane"] = float(json_cfg["near_plane"])
+        json_cfg["far_plane"] = float(json_cfg["far_plane"])
+
+        if json_cfg["cam_base_mode"] not in valid_cam_base_mode:
+            print("[mask-aware/json] invalid cam_base_mode, use base_to_cam__predef")
+            json_cfg["cam_base_mode"] = "base_to_cam__predef"
+
+        if (not json_cfg["use_agent_intrinsics"]) and (json_cfg["intrinsics_npy"] is None):
+            print("[mask-aware/json] intrinsics_npy is None while use_agent_intrinsics=False, fallback to agent intrinsics")
+            json_cfg["use_agent_intrinsics"] = True
+
+        merged_cfg["json_mask"] = edict(json_cfg)
+    except Exception as exc:
+        print(f"[mask-aware] invalid config, fallback to disabled: {exc}")
+        merged_cfg = deepcopy(default_cfg)
+        merged_cfg["json_mask"] = edict(deepcopy(default_json_mask_cfg))
+
+    if merged_cfg["infer_none_policy"] not in valid_none_policy:
+        print("[mask-aware] invalid infer_none_policy, use no_mask_fallback")
+        merged_cfg["infer_none_policy"] = "no_mask_fallback"
+
+    if merged_cfg["empty_cloud_policy"] not in valid_empty_cloud_policy:
+        print("[mask-aware] invalid empty_cloud_policy, use warn_and_skip_filter")
+        merged_cfg["empty_cloud_policy"] = "warn_and_skip_filter"
+
+    return edict(merged_cfg)
+
+
+def _log_mask_aware_summary(mask_cfg):
+    # 启动时打印一次配置摘要用于排查
+    print(
+        "[mask-aware] enabled={} 3d_filter={} 2d_reweight={} threshold={} "
+        "none_policy={} empty_cloud_policy={}".format(
+            mask_cfg.enabled,
+            mask_cfg.enable_3d_filter,
+            mask_cfg.enable_2d_reweight,
+            mask_cfg.mask_threshold,
+            mask_cfg.infer_none_policy,
+            mask_cfg.empty_cloud_policy,
+        )
+    )
+
+
+def _log_mask_fallback(step, reason, action):
+    # 异常回退统一日志输出
+    print(f"[mask-aware] step={step} reason={reason} action={action}")
+
+
+# ── 模块级 renderer 引用，由 evaluate() 在启动时初始化 ──
+_arm_renderer = None
+_MASK_STREAM_WINDOW_NAME = "mask_overlay_stream"
+_mask_vis_disabled = False
+
+
+class NoGripperSeparateRobotRenderer:
+    """
+    与 notebook 最后一个验证正确的 cell 严格对齐的 renderer。
+    """
+
+    def __init__(
+        self,
+        left_joint_cfgs,
+        right_joint_cfgs,
+        cam_to_left_base,
+        cam_to_right_base,
+        intrinsic,
+        width = 1280,
+        height = 720,
+        near_plane = 0.01,
+        far_plane = 100.0,
+        urdf_file = None,
+    ):
+        if urdf_file is None:
+            urdf_file = {
+                "left": os.path.join("airexo", "airexo", "urdf_models", "robot", "left_robot_inhand.urdf"),
+                "right": os.path.join("airexo", "airexo", "urdf_models", "robot", "right_robot_inhand.urdf"),
+            }
+        self.left_joint_cfgs = left_joint_cfgs
+        self.right_joint_cfgs = right_joint_cfgs
+        self.cam_to_left_base = np.asarray(cam_to_left_base, dtype = np.float64)
+        self.cam_to_right_base = np.asarray(cam_to_right_base, dtype = np.float64)
+        self.urdf_file = {"left": str(urdf_file["left"]), "right": str(urdf_file["right"])}
+        self.renderer = o3d.visualization.rendering.OffscreenRenderer(int(width), int(height))
+        self.material = o3d.visualization.rendering.MaterialRecord()
+        self.material.shader = "defaultLit"
+        cur_transforms_left, self.visuals_map_left = robot_helper.forward_kinematic_single(
+            joint = np.zeros((self.left_joint_cfgs.num_joints, ), dtype = np.float32),
+            joint_cfgs = self.left_joint_cfgs,
+            is_rad = True,
+            urdf_file = self.urdf_file["left"],
+            with_visuals_map = True,
+        )
+        cur_transforms_right, self.visuals_map_right = robot_helper.forward_kinematic_single(
+            joint = np.zeros((self.right_joint_cfgs.num_joints, ), dtype = np.float32),
+            joint_cfgs = self.right_joint_cfgs,
+            is_rad = True,
+            urdf_file = self.urdf_file["right"],
+            with_visuals_map = True,
+        )
+        self.model_meshes_left = {}
+        self.last_transforms_left = {}
+        self.model_meshes_right = {}
+        self.last_transforms_right = {}
+        self._init_side_meshes("left", cur_transforms_left, self.visuals_map_left, self.cam_to_left_base, self.urdf_file["left"], self.model_meshes_left, self.last_transforms_left)
+        self._init_side_meshes("right", cur_transforms_right, self.visuals_map_right, self.cam_to_right_base, self.urdf_file["right"], self.model_meshes_right, self.last_transforms_right)
+        self.renderer.scene.camera.set_projection(np.asarray(intrinsic, dtype = np.float64), float(near_plane), float(far_plane), float(width), float(height))
+
+    def _compose_tf(self, cam_to_base, transform, offset):
+        return (
+            np.asarray(O3D_RENDER_TRANSFORMATION, dtype = np.float64)
+            @ np.asarray(cam_to_base, dtype = np.float64)
+            @ np.asarray(ROBOT_PREDEFINED_TRANSFORMATION, dtype = np.float64)
+            @ transform.matrix()
+            @ offset.matrix()
+        )
+
+    def _init_side_meshes(self, side, cur_transforms, visuals_map, cam_to_base, urdf_file, mesh_store, tf_store):
+        for link, transform in cur_transforms.items():
+            for v in visuals_map[link]:
+                if v.geom_param is None:
+                    continue
+                mesh_name = f"{side}///{link}///{v.geom_param}"
+                tf = self._compose_tf(cam_to_base, transform, v.offset)
+                mesh = o3d.io.read_triangle_mesh(os.path.join(os.path.dirname(urdf_file), v.geom_param))
+                mesh.transform(tf)
+                mesh.compute_vertex_normals()
+                mesh_store[mesh_name] = mesh
+                tf_store[mesh_name] = tf
+                self.renderer.scene.add_geometry(mesh_name, mesh, self.material)
+
+    def update_joints(self, left_joint, right_joint):
+        cur_transforms_left = robot_helper.forward_kinematic_single(
+            joint = np.asarray(left_joint, dtype = np.float32),
+            joint_cfgs = self.left_joint_cfgs,
+            is_rad = True,
+            urdf_file = self.urdf_file["left"],
+            with_visuals_map = False,
+        )
+        cur_transforms_right = robot_helper.forward_kinematic_single(
+            joint = np.asarray(right_joint, dtype = np.float32),
+            joint_cfgs = self.right_joint_cfgs,
+            is_rad = True,
+            urdf_file = self.urdf_file["right"],
+            with_visuals_map = False,
+        )
+        self.renderer.scene.clear_geometry()
+        for link, transform in cur_transforms_left.items():
+            for v in self.visuals_map_left[link]:
+                if v.geom_param is None:
+                    continue
+                mesh_name = f"left///{link}///{v.geom_param}"
+                tf = self._compose_tf(self.cam_to_left_base, transform, v.offset)
+                self.model_meshes_left[mesh_name].transform(tf @ np.linalg.inv(self.last_transforms_left[mesh_name]))
+                self.model_meshes_left[mesh_name].compute_vertex_normals()
+                self.last_transforms_left[mesh_name] = tf
+                self.renderer.scene.add_geometry(mesh_name, self.model_meshes_left[mesh_name], self.material)
+        for link, transform in cur_transforms_right.items():
+            for v in self.visuals_map_right[link]:
+                if v.geom_param is None:
+                    continue
+                mesh_name = f"right///{link}///{v.geom_param}"
+                tf = self._compose_tf(self.cam_to_right_base, transform, v.offset)
+                self.model_meshes_right[mesh_name].transform(tf @ np.linalg.inv(self.last_transforms_right[mesh_name]))
+                self.model_meshes_right[mesh_name].compute_vertex_normals()
+                self.last_transforms_right[mesh_name] = tf
+                self.renderer.scene.add_geometry(mesh_name, self.model_meshes_right[mesh_name], self.material)
+
+    def render_image(self):
+        return np.asarray(self.renderer.render_to_image(), dtype = np.uint8)
+
+    def render_depth(self):
+        return np.asarray(self.renderer.render_to_depth_image(z_in_view_space = True), dtype = np.float32)
+
+    def render_mask(self, depth = None):
+        if depth is None:
+            depth = self.render_depth()
+        mask = np.zeros(depth.shape, dtype = np.uint8)
+        mask[depth < np.inf] = 255
+        return mask
+
+_JSON_CAM_BASE_MODE_CHOICES = {
+    "base_to_cam__predef",
+    "base_to_cam__raw",
+    "cam_to_base__predef",
+    "cam_to_base__raw",
+}
+
+
+def _invert_T(T):
+    T = np.asarray(T, dtype = np.float64)
+    out = np.eye(4, dtype = np.float64)
+    out[:3, :3] = T[:3, :3].T
+    out[:3, 3] = -T[:3, :3].T @ T[:3, 3]
+    return out
+
+
+def _pose7_wxyz_to_mat(pose7):
+    pose7 = np.asarray(pose7, dtype = np.float64).reshape(7)
+    xyz = pose7[:3]
+    quat_wxyz = pose7[3:]
+    quat_norm = np.linalg.norm(quat_wxyz)
+    if quat_norm < 1e-12:
+        raise ValueError("invalid quaternion norm in pose7")
+    quat_wxyz = quat_wxyz / quat_norm
+
+    mat = np.eye(4, dtype = np.float64)
+    mat[:3, :3] = quat2mat(quat_wxyz)
+    mat[:3, 3] = xyz
+    return mat
+
+
+def _load_json_pose(path):
+    with open(path, "r", encoding = "utf-8") as f:
+        data = json.load(f)
+    if "pose_in_link" not in data:
+        raise KeyError(f"Missing pose_in_link in {path}")
+    return _pose7_wxyz_to_mat(data["pose_in_link"])
+
+
+def _load_intrinsic_from_npy(path, selector = "first"):
+    data = np.load(path, allow_pickle = True)
+    if isinstance(data, np.ndarray) and data.shape == ():
+        data = data.item()
+    if not isinstance(data, dict):
+        raise TypeError(f"Intrinsics file {path} does not contain a dict")
+
+    if selector == "first":
+        key = sorted(data.keys())[0]
+        return np.asarray(data[key], dtype = np.float32)
+
+    if selector == "mean":
+        mats = np.stack([np.asarray(v, dtype = np.float32) for v in data.values()], axis = 0)
+        return mats.mean(axis = 0).astype(np.float32)
+
+    if selector not in data:
+        raise KeyError(f"Intrinsic selector {selector} not in keys {list(data.keys())}")
+    return np.asarray(data[selector], dtype = np.float32)
+
+
+def _cam_base_from_json(T_json, mode):
+    T_json = np.asarray(T_json, dtype = np.float64)
+    if mode not in _JSON_CAM_BASE_MODE_CHOICES:
+        raise ValueError(f"Invalid cam_base_mode {mode}")
+
+    robot_predef_inv = _invert_T(np.asarray(ROBOT_PREDEFINED_TRANSFORMATION, dtype = np.float64))
+
+    if mode == "base_to_cam__predef":
+        return _invert_T(T_json) @ robot_predef_inv
+    if mode == "base_to_cam__raw":
+        return _invert_T(T_json)
+    if mode == "cam_to_base__predef":
+        return T_json @ robot_predef_inv
+    return T_json
+
+
+def get_arm_joints(agent):
+    """
+    通过真实 eval agent 读取双臂当前关节角和夹爪宽度。
+
+    Returns
+    -------
+    (left_joint, right_joint) : tuple of np.ndarray, shape (8,)
+        前 7 个元素为关节角（弧度），最后一个元素为夹爪宽度（米）。
+    None
+        无法获取时返回 None，上层会触发 no_mask_fallback。
+    """
+    try:
+        lowdim = _load_test_lowdim(test_low_dim)
+        left_joint = np.asarray(lowdim["robot_left"], dtype = np.float32).reshape(-1)
+        right_joint = np.asarray(lowdim["robot_right"], dtype = np.float32).reshape(-1)
+        left_gripper = np.asarray(lowdim["gripper_left"], dtype = np.float32).reshape(-1)
+        right_gripper = np.asarray(lowdim["gripper_right"], dtype = np.float32).reshape(-1)
+
+        if left_joint.size < 7 or right_joint.size < 7:
+            raise ValueError(
+                f"test_low_dim robot joint length mismatch: left={left_joint.size}, right={right_joint.size}"
+            )
+        if left_gripper.size < 1 or right_gripper.size < 1:
+            raise ValueError(
+                f"test_low_dim gripper width length mismatch: left={left_gripper.size}, right={right_gripper.size}"
+            )
+
+        left_joint = np.concatenate([left_joint[:7], left_gripper[:1]], axis = 0)
+        right_joint = np.concatenate([right_joint[:7], right_gripper[:1]], axis = 0)
+        return left_joint, right_joint
+    except Exception as exc:
+        print(f"[mask-aware] failed to read arm joints from test_low_dim: {exc}")
+        return None
+
+
+def infer_mask(color, depth, proprio, meta, agent = None):
+    """
+    通过 URDF 渲染当前机械臂姿态，返回像素级 mask。
+
+    Returns
+    -------
+    mask : np.ndarray (H, W) uint8  —— 255 = 机械臂像素，0 = 背景
+    None  —— renderer 未初始化或关节角不可用时
+    """
+    if _arm_renderer is None:
+        return None
+    joints = get_arm_joints(agent)
+    if joints is None:
+        return None
+    left_joint, right_joint = joints
+    _arm_renderer.update_joints(left_joint, right_joint)
+    return _arm_renderer.render_mask()
+
+
+def _to_numpy_mask(mask):
+    # 将输入 mask 统一转换为 numpy
+    if isinstance(mask, torch.Tensor):
+        return mask.detach().cpu().numpy()
+    return np.asarray(mask)
+
+
+def _normalize_mask01(mask, depth_shape, mask_cfg):
+    # 将输入 mask 统一到 [0, 1] 浮点二值图，1 表示不可信（需要屏蔽）
+    mask_np = _to_numpy_mask(mask)
+
+    if mask_np.ndim == 3:
+        if mask_np.shape[0] == 1:
+            mask_np = mask_np[0]
+        elif mask_np.shape[-1] == 1:
+            mask_np = mask_np[..., 0]
+        else:
+            raise ValueError(f"unsupported mask shape: {mask_np.shape}")
+    elif mask_np.ndim != 2:
+        raise ValueError(f"unsupported mask shape: {mask_np.shape}")
+
+    target_h, target_w = int(depth_shape[0]), int(depth_shape[1])
+    if mask_np.shape[0] != target_h or mask_np.shape[1] != target_w:
+        print(
+            "[mask-aware/3donly] mask size mismatch, resize with nearest: "
+            f"mask={mask_np.shape}, depth=({target_h}, {target_w})"
+        )
+        mask_np = cv2.resize(
+            mask_np.astype(np.float32),
+            (target_w, target_h),
+            interpolation = cv2.INTER_NEAREST,
+        )
+
+    threshold = float(mask_cfg.mask_threshold)
+    if bool(mask_cfg.mask_white_is_untrusted):
+        mask01 = (mask_np > threshold).astype(np.float32)
+    else:
+        mask01 = (mask_np <= threshold).astype(np.float32)
+
+    # hard-coded dilation for quick testing
+    dilate_radius = 10
+    if dilate_radius > 0 and np.any(mask01 > 0):
+        ks = 2 * int(dilate_radius) + 1
+        kernel = np.ones((ks, ks), np.uint8)
+        mask01 = cv2.dilate(
+            (mask01 > 0).astype(np.uint8),
+            kernel,
+            iterations = 1,
+        ).astype(np.float32)
+
+    return mask01
+
+
+def _safe_infer_mask(color, depth, proprio, meta, mask_cfg, agent = None):
+    # 执行 infer_mask 并把异常统一转换为回退信号
+    try:
+        raw_mask = infer_mask(color, depth, proprio, meta, agent = agent)
+    except Exception:
+        return None, "infer_exception", None
+
+    if raw_mask is None:
+        return None, "infer_none", None
+
+    try:
+        mask01 = _normalize_mask01(raw_mask, depth.shape[:2], mask_cfg)
+    except Exception:
+        return None, "mask_invalid", raw_mask
+
+    return mask01, None, raw_mask
+
+
+
+def _save_mask_visualization(colors, mask01, step, vis_dir):
+    if colors is None or mask01 is None:
+        return
+
+    os.makedirs(vis_dir, exist_ok = True)
+
+    mask_np = np.asarray(mask01)
+    if mask_np.ndim == 3:
+        mask_np = mask_np[..., 0]
+    mask_u8 = ((mask_np > 0).astype(np.uint8) * 255)
+
+    overlay = np.asarray(colors, dtype = np.uint8).copy()
+    mask_bool = mask_u8 > 0
+    if np.any(mask_bool):
+        overlay_f32 = overlay.astype(np.float32)
+        overlay_f32[mask_bool] = 0.6 * overlay_f32[mask_bool] + 0.4 * np.array([255.0, 0.0, 0.0], dtype = np.float32)
+        overlay = np.clip(overlay_f32, 0, 255).astype(np.uint8)
+
+    mask_path = os.path.join(vis_dir, "mask_step_{:06d}.png".format(int(step)))
+    overlay_path = os.path.join(vis_dir, "mask_overlay_step_{:06d}.png".format(int(step)))
+    cv2.imwrite(mask_path, mask_u8)
+    cv2.imwrite(overlay_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+    print("[vis] saved mask: {}".format(mask_path))
+    print("[vis] saved mask overlay: {}".format(overlay_path))
+
+
+# def _show_mask_visualization_stream(colors, mask01, step, config):
+#     if mask01 is None:
+#         return
+#
+#     global _mask_vis_disabled
+#     if _mask_vis_disabled:
+#         return
+#
+#     window_name = getattr(config.deploy, "vis_window_name", _MASK_STREAM_WINDOW_NAME)
+#     if window_name is None or len(str(window_name).strip()) == 0:
+#         window_name = _MASK_STREAM_WINDOW_NAME
+#     window_name = str(window_name)
+#
+#     mask_np = np.asarray(mask01)
+#     if mask_np.ndim == 3:
+#         mask_np = mask_np[..., 0]
+#     mask_u8 = ((mask_np > 0).astype(np.uint8) * 255)
+#
+#     overlay = np.asarray(colors, dtype = np.uint8).copy()
+#     mask_bool = mask_u8 > 0
+#     if np.any(mask_bool):
+#         overlay_f32 = overlay.astype(np.float32)
+#         overlay_f32[mask_bool] = 0.6 * overlay_f32[mask_bool] + 0.4 * np.array([255.0, 0.0, 0.0], dtype = np.float32)
+#         overlay = np.clip(overlay_f32, 0, 255).astype(np.uint8)
+#
+#     overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
+#     cv2.putText(
+#         overlay_bgr,
+#         f"step: {step}",
+#         (20, 36),
+#         cv2.FONT_HERSHEY_SIMPLEX,
+#         1.0,
+#         (0, 255, 0),
+#         2,
+#         cv2.LINE_AA,
+#     )
+#
+#     try:
+#         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+#
+#         # 窗口大小可配：优先固定宽高，其次按比例放大原图
+#         win_w = getattr(config.deploy, "vis_window_width", None)
+#         win_h = getattr(config.deploy, "vis_window_height", None)
+#         if win_w is not None and win_h is not None:
+#             win_w = int(win_w)
+#             win_h = int(win_h)
+#         else:
+#             scale = float(getattr(config.deploy, "vis_window_scale", 1.5))
+#             h, w = overlay_bgr.shape[:2]
+#             win_w = max(1, int(w * scale))
+#             win_h = max(1, int(h * scale))
+#
+#         cv2.resizeWindow(window_name, win_w, win_h)
+#         cv2.imshow(window_name, overlay_bgr)
+#         cv2.waitKey(1)
+#     except cv2.error as exc:
+#         _mask_vis_disabled = True
+#         print(f"[vis] OpenCV stream visualization disabled: {exc}")
+
+
+def _build_image_mask_weight(mask01, image_processor):
+    # 根据二维 mask 构建图像 patch 级可信度权重
+    try:
+        mask_tensor = torch.from_numpy(mask01[np.newaxis].astype(np.float32))
+        mask_tensor = resize_image(
+            mask_tensor,
+            image_processor.img_size,
+            interpolation = T.InterpolationMode.NEAREST,
+        )
+        mask_ratio = image_processor.image_coord_pooling(mask_tensor)
+        image_mask_weight = (1.0 - mask_ratio).clamp(0.0, 1.0).to(torch.float32)
+    except Exception:
+        return None
+
+    return image_mask_weight
+
+
+def _format_step_action_for_save(step_action, action_dim):
+    # 将 step_action 规整到定长向量；无动作时使用 NaN 占位
+    action_dim = int(action_dim)
+    save_action = np.full((action_dim,), np.nan, dtype = np.float32)
+
+    if step_action is None:
+        return save_action
+
+    try:
+        action_np = np.asarray(step_action, dtype = np.float32).reshape(-1)
+    except Exception:
+        return save_action
+
+    if action_np.size <= 0:
+        return save_action
+
+    copy_n = min(action_dim, int(action_np.size))
+    save_action[:copy_n] = action_np[:copy_n]
+    if int(action_np.size) != action_dim:
+        print(
+            f"[save] action dim mismatch at runtime: got={int(action_np.size)} expected={action_dim}, "
+            f"truncate_or_pad_to={action_dim}"
+        )
+    return save_action
+
+
+
+def _format_mask_u8_for_save(mask01, depth_shape):
+    # 将 mask 统一为 uint8 0/255；若无 mask 则返回全零图
+    h, w = int(depth_shape[0]), int(depth_shape[1])
+    if mask01 is None:
+        return np.zeros((h, w), dtype = np.uint8)
+
+    mask_np = np.asarray(mask01)
+    if mask_np.ndim == 3:
+        if mask_np.shape[0] == 1:
+            mask_np = mask_np[0]
+        elif mask_np.shape[-1] == 1:
+            mask_np = mask_np[..., 0]
+        else:
+            mask_np = mask_np[..., 0]
+    if mask_np.shape[:2] != (h, w):
+        mask_np = cv2.resize(
+            mask_np.astype(np.float32),
+            (w, h),
+            interpolation = cv2.INTER_NEAREST,
+        )
+    return ((mask_np > 0.5).astype(np.uint8) * 255)
+
+
+
+def _save_step_observation_action(
+    colors,
+    depths,
+    mask01,
+    step_action,
+    step,
+    rgb_dir,
+    depth_dir,
+    mask_dir,
+    action_dir,
+    action_dim,
+):
+    # 保存每个 step 的 RGB、深度、mask 与对应动作向量
+    rgb_path = os.path.join(rgb_dir, f"step_{int(step):06d}.png")
+    depth_path = os.path.join(depth_dir, f"step_{int(step):06d}.png")
+    mask_path = os.path.join(mask_dir, f"step_{int(step):06d}.png")
+    action_path = os.path.join(action_dir, f"step_{int(step):06d}.npy")
+
+    try:
+        colors_u8 = np.asarray(colors, dtype = np.uint8)
+        if colors_u8.ndim == 3 and colors_u8.shape[-1] == 3:
+            rgb_bgr = cv2.cvtColor(colors_u8, cv2.COLOR_RGB2BGR)
+        else:
+            rgb_bgr = colors_u8
+        if not cv2.imwrite(rgb_path, rgb_bgr):
+            print(f"[save] failed to write rgb image: {rgb_path}")
+    except Exception as exc:
+        print(f"[save] failed to save rgb at step={step}: {exc}")
+
+    try:
+        depth_np = np.asarray(depths)
+        if np.issubdtype(depth_np.dtype, np.integer):
+            depth_u16 = depth_np.astype(np.uint16)
+        else:
+            depth_u16 = np.clip(np.rint(depth_np), 0, np.iinfo(np.uint16).max).astype(np.uint16)
+        if not cv2.imwrite(depth_path, depth_u16):
+            print(f"[save] failed to write depth image: {depth_path}")
+    except Exception as exc:
+        print(f"[save] failed to save depth at step={step}: {exc}")
+
+    try:
+        mask_u8 = _format_mask_u8_for_save(mask01, depth_np.shape[:2])
+        if not cv2.imwrite(mask_path, mask_u8):
+            print(f"[save] failed to write mask image: {mask_path}")
+    except Exception as exc:
+        print(f"[save] failed to save mask at step={step}: {exc}")
+
+    try:
+        action_np = _format_step_action_for_save(step_action, action_dim)
+        np.save(action_path, action_np, allow_pickle = False)
+    except Exception as exc:
+        print(f"[save] failed to save action at step={step}: {exc}")
+
+
+
+def load_test_obs(color_path, depth_path):
+    # 1. 加载彩色图并转为 RGB (OpenCV 默认读入是 BGR)
+    color_image = cv2.imread(color_path)
+    if color_image is None:
+        raise ValueError(f"无法加载图片: {color_path}")
+    color_image = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB).astype(np.uint8)
+
+    # 2. 加载深度图
+    # 注意：必须使用 cv2.IMREAD_UNCHANGED 才能保留 16bit 深度信息
+    depth_image = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+    if depth_image is None:
+        raise ValueError(f"无法加载深度图: {depth_path}")
+    
+    # 确保是 uint16。如果你的 PNG 是 8bit 的，需要根据量化比例转回 uint16 (通常单位是毫米)
+    depth_image = depth_image.astype(np.uint16)
+
+    return color_image, depth_image
+
+
+def create_point_cloud(colors, depths, intrinsics, config, depth_scale = 1000.0, rescale_factor = 1):
+    """
+    color, depth => point cloud
+    """
+    if rescale_factor != 1:
+        H, W = depths.shape
+        h, w = int(H * rescale_factor), int(W * rescale_factor)
+        colors = colors.transpose([2, 0, 1]).astype(np.float32)
+        colors = torch.from_numpy(colors)
+        colors = np.ascontiguousarray(resize_image(colors, [h, w]).numpy().transpose([1, 2, 0]))
+        depths = depths.astype(np.float32)
+        depths = torch.from_numpy(depths[np.newaxis])
+        depths = resize_image(depths, [h,w], interpolation = T.InterpolationMode.NEAREST)[0]
+        depths = depths.numpy()
+
+    # generate point cloud
+    h, w = depths.shape
+    fx, fy = intrinsics[0, 0] * rescale_factor, intrinsics[1, 1] * rescale_factor
+    cx, cy = intrinsics[0, 2] * rescale_factor, intrinsics[1, 2] * rescale_factor
+    colors = o3d.geometry.Image(colors.astype(np.uint8))
+    depths = o3d.geometry.Image(depths.astype(np.float32))
+    camera_intrinsics = o3d.camera.PinholeCameraIntrinsic(
+        width = w, height = h, fx = fx, fy = fy, cx = cx, cy = cy
+    )
+    rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+        colors, depths, depth_scale, convert_rgb_to_intensity = False
+    )
+    cloud = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, camera_intrinsics)
+    # crop point cloud
+    bbox3d = o3d.geometry.AxisAlignedBoundingBox(config.deploy.workspace.min, config.deploy.workspace.max)
+    cloud = cloud.crop(bbox3d)
+    # downsample
+    cloud = cloud.voxel_down_sample(config.data.voxel_size)
+    return cloud
+
+
+def create_input(colors, depths, cam_intrinsics, config, depth_scale = 1000.0, rescale_factor = 1):
+    """
+    colors, depths => coords, points
+    """
+    # create point cloud
+    cloud = create_point_cloud(
+        colors, 
+        depths, 
+        cam_intrinsics, 
+        config,
+        depth_scale = depth_scale,
+        rescale_factor = rescale_factor,
+    )
+
+    # convert to sparse tensor
+    points = np.asarray(cloud.points)
+    coords = np.ascontiguousarray(points / config.data.voxel_size, dtype = np.int32)
+
+    return coords, points, cloud
+    
+
+def create_batch(coords, points):
+    """
+    coords, points => batch coords, batch feats
+    """
+    import MinkowskiEngine as ME
+    input_coords = [coords]
+    input_feats = [points.astype(np.float32)]
+    coords_batch, feats_batch = ME.utils.sparse_collate(input_coords, input_feats)
+    return coords_batch, feats_batch
+
+
+def process_state(state, config, to_control = True):
+    if config.robot_type == "single":
+        if to_control:
+            state[..., 0: 3] = (state[..., 0: 3] + 1) / 2.0 * (config.data.normalization.trans_max - config.data.normalization.trans_min) + config.data.normalization.trans_min
+            state[..., 9] = (state[..., 9] + 1) / 2.0 * config.data.normalization.max_gripper_width
+        else:
+            state[..., 0: 3] = (state[..., 0: 3] - config.data.normalization.trans_min) / (config.data.normalization.trans_max - config.data.normalization.trans_min) * 2.0 - 1
+            state[..., 9] = state[..., 9] / config.data.normalization.max_gripper_width * 2.0 - 1
+    else:
+        if to_control:
+            state[..., 0: 3] = (state[..., 0: 3] + 1) / 2.0 * (config.data.normalization.trans_max - config.data.normalization.trans_min) + config.data.normalization.trans_min
+            state[..., 10: 13] = (state[..., 10: 13] + 1) / 2.0 * (config.data.normalization.trans_max - config.data.normalization.trans_min) + config.data.normalization.trans_min
+            state[..., 9] = (state[..., 9] + 1) / 2.0 * config.data.normalization.max_gripper_width
+            state[..., 19] = (state[..., 19] + 1) / 2.0 * config.data.normalization.max_gripper_width
+        else:
+            state[..., 0: 3] = (state[..., 0: 3] - config.data.normalization.trans_min) / (config.data.normalization.trans_max - config.data.normalization.trans_min) * 2.0 - 1
+            state[..., 10: 13] = (state[..., 10: 13] - config.data.normalization.trans_min) / (config.data.normalization.trans_max - config.data.normalization.trans_min) * 2.0 - 1
+            state[..., 9] = state[..., 9] / config.data.normalization.max_gripper_width * 2.0 - 1
+            state[..., 19] = state[..., 19] / config.data.normalization.max_gripper_width * 2.0 - 1
+
+    return state
+
+
+
+def evaluate(args_override):
+    # load default arguments
+    args = deepcopy(default_args)
+    for key, value in args_override.items():
+        args[key] = value
+
+    # load config
+    with open(args.config, "r") as f:
+        config = edict(yaml.load(f, Loader = yaml.FullLoader))
+    config.data.normalization.trans_min = np.asarray(config.data.normalization.trans_min)
+    config.data.normalization.trans_max = np.asarray(config.data.normalization.trans_max)
+    config.mask_aware = _build_mask_aware_cfg(config)
+
+    # set seed
+    set_seed(config.deploy.seed)
+
+    # load policy for local inference
+    if args.type == "local":
+        from policy import RISE2
+        # set up device
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # load policy
+        print("Loading policy ...")
+        policy = RISE2(
+            num_action = config.data.num_action,
+            obs_feature_dim = config.model.obs_feature_dim,
+            cloud_enc_dim = config.model.cloud_enc_dim,
+            image_enc_dim = config.model.image_enc_dim,
+            action_dim = 10 if config.robot_type == "single" else 20,
+            hidden_dim = config.model.hidden_dim,
+            nheads = config.model.nheads,
+            num_attn_layers = config.model.num_attn_layers,
+            dim_feedforward = config.model.dim_feedforward,
+            dropout = config.model.dropout,
+            image_enc = config.model.image_enc,
+            interp_fn_mode = config.model.interp_fn_mode,
+            image_enc_finetune = config.model.image_enc_finetune,
+            image_enc_dtype = config.model.image_enc_dtype
+        ).to(device)
+
+        # load checkpoint
+        assert args.ckpt is not None, "Please provide the checkpoint to evaluate."
+        policy.load_state_dict(torch.load(args.ckpt, map_location = device), strict = False)
+        print("Checkpoint {} loaded.".format(args.ckpt))
+
+        # set evaluation
+        policy.eval()
+
+    else:
+        # connect to remote inference service
+        print("Connecting to remote server ...")
+        policy = WebsocketClientPolicy(host = args.host, port = args.port)
+
+    # projector
+    Projector = SingleArmProjector if config.robot_type == "single" else DualArmProjector
+    projector_camera_serial = config.deploy.agent.camera_serial
+    try:
+        projector = Projector(args.calib_rise2, projector_camera_serial)
+    except AssertionError:
+        calib_file = np.load(args.calib_rise2, allow_pickle = True).item()
+        fallback_serial = calib_file["camera_serials_global"][0]
+        print(
+            "[projector] requested camera_serial={} not found in calib {}, fallback to {}".format(
+                projector_camera_serial,
+                args.calib_rise2,
+                fallback_serial,
+            )
+        )
+        projector = Projector(args.calib_rise2, fallback_serial)
+
+    # image processor
+    image_enc = config.model.image_enc
+    if image_enc == "resnet18":
+        img_size = config.data.aligner.img_size_resnet
+        img_coord_size = config.data.aligner.img_coord_size_resnet
+    elif image_enc.startswith("dinov2"):
+        img_size = config.data.aligner.img_size_dinov2
+        img_coord_size = config.data.aligner.img_coord_size_dinov2
+    elif image_enc.startswith("dinov3"):
+        img_size = config.data.aligner.img_size_dinov3
+        img_coord_size = config.data.aligner.img_coord_size_dinov3
+    else:
+        raise ValueError(f"Unknown image encoder: {image_enc}")
+    
+    image_processor = ImageProcessor(
+        img_size = img_size,
+        img_coord_size = img_coord_size,
+        voxel_size = config.data.voxel_size,
+        img_mean = config.data.normalization.img_mean,
+        img_std = config.data.normalization.img_std
+    )
+
+    # evaluation
+    # Agent = SingleArmAgent if config.robot_type == "single" else DualArmAgent
+    # agent = Agent(**config.deploy.agent)
+
+    # ensemble buffer
+    ensemble_buffer = EnsembleBuffer(mode = config.deploy.ensemble_mode)
+
+    # 每步保存观测与动作（目录固定为仓库下 visdebug）
+    save_root = os.path.join(os.getcwd(), "visdebug")
+    os.makedirs(save_root, exist_ok = True)
+
+    rgb_save_dir = os.path.join(save_root, "rgb")
+    depth_save_dir = os.path.join(save_root, "depth")
+    mask_save_dir = os.path.join(save_root, "mask")
+    action_save_dir = os.path.join(save_root, "actions")
+    vis_save_dir = os.path.join(save_root, "vis")
+    os.makedirs(rgb_save_dir, exist_ok = True)
+    os.makedirs(depth_save_dir, exist_ok = True)
+    os.makedirs(mask_save_dir, exist_ok = True)
+    os.makedirs(action_save_dir, exist_ok = True)
+    os.makedirs(vis_save_dir, exist_ok = True)
+    action_dim_for_save = 10 if config.robot_type == "single" else 20
+    print(f"[save] per-step rgb/depth/mask/action saving enabled: {save_root}")
+
+    # 输出 mask-aware 配置摘要
+    _log_mask_aware_summary(config.mask_aware)
+
+    # 初始化 JSON-based separate renderer（仅本地 mask-aware 模式）
+    global _arm_renderer
+    _arm_renderer = None
+    if config.mask_aware.enabled and args.type == "local":
+        try:
+            json_cfg = config.mask_aware.json_mask
+            left_json_path = json_cfg.left_json
+            right_json_path = json_cfg.right_json
+            if left_json_path is None or right_json_path is None:
+                raise ValueError(
+                    "mask_aware.json_mask.left_json/right_json must be provided for json-based mask rendering"
+                )
+
+            left_json = _load_json_pose(left_json_path)
+            right_json = _load_json_pose(right_json_path)
+            left_cam_to_base = _cam_base_from_json(left_json, json_cfg.cam_base_mode).astype(np.float32)
+            right_cam_to_base = _cam_base_from_json(right_json, json_cfg.cam_base_mode).astype(np.float32)
+
+            if bool(json_cfg.use_agent_intrinsics):
+                # intrinsic = np.asarray(agent.intrinsics, dtype = np.float32)
+                # for train data debug
+                intrinsic = fake_intrinsics.astype(np.float32)
+
+                intrinsic_source = "agent.intrinsics"
+            else:
+                intrinsic = _load_intrinsic_from_npy(
+                    json_cfg.intrinsics_npy,
+                    selector = json_cfg.intrinsic_selector,
+                ).astype(np.float32)
+                intrinsic_source = f"{json_cfg.intrinsics_npy}:{json_cfg.intrinsic_selector}"
+
+            _left_cfg = edict(
+                yaml.safe_load(open(os.path.join("airexo", "airexo", "configs", "joint", "left", "robot.yaml")))
+            )
+            _right_cfg = edict(
+                yaml.safe_load(open(os.path.join("airexo", "airexo", "configs", "joint", "right", "robot.yaml")))
+            )
+
+            render_height, render_width = int(json_cfg.height), int(json_cfg.width)
+            if render_height <= 0 or render_width <= 0:
+                raise ValueError(f"invalid json mask render size: width={render_width}, height={render_height}")
+
+            if intrinsic.shape[0] >= 2 and intrinsic.shape[1] >= 3:
+                cx = float(intrinsic[0, 2])
+                cy = float(intrinsic[1, 2])
+                inferred_width = int(round(cx * 2.0))
+                inferred_height = int(round(cy * 2.0))
+                if inferred_width > 0 and inferred_height > 0:
+                    if abs(inferred_width - render_width) > 8 or abs(inferred_height - render_height) > 8:
+                        print(
+                            "[mask-aware/json] override render size from intrinsic principal point: "
+                            f"config=({render_width}, {render_height}) -> inferred=({inferred_width}, {inferred_height})"
+                        )
+                        render_width = inferred_width
+                        render_height = inferred_height
+
+            _arm_renderer = NoGripperSeparateRobotRenderer(
+                left_joint_cfgs = _left_cfg,
+                right_joint_cfgs = _right_cfg,
+                cam_to_left_base = left_cam_to_base,
+                cam_to_right_base = right_cam_to_base,
+                intrinsic = intrinsic,
+                width = render_width,
+                height = render_height,
+                near_plane = float(json_cfg.near_plane),
+                far_plane = float(json_cfg.far_plane),
+                urdf_file = {
+                    "left": str(json_cfg.left_urdf),
+                    "right": str(json_cfg.right_urdf),
+                },
+            )
+            print(
+                "[mask-aware/json] renderer initialized "
+                f"(cam_mode={json_cfg.cam_base_mode}, intrinsic={intrinsic_source}, "
+                f"left_json={left_json_path}, right_json={right_json_path}, "
+                "side_predefined_rotation=disabled, gripper_reconstruction=disabled)"
+            )
+        except Exception as _e:
+            print(f"[mask-aware/json] renderer init failed, mask disabled: {_e}")
+            _arm_renderer = None
+
+    # 记录异常回退统计
+    mask_stats = {
+        "infer_none": 0,
+        "infer_exception": 0,
+        "mask_invalid": 0,
+        "empty_cloud_skip": 0,
+        "reweight_fallback": 0,
+        "points_nonfinite": 0,
+        "weight_nonfinite": 0,
+    }
+
+    # evaluation rollout
+    print("Ready for rollout. Press Enter to continue...")
+    input()
+    
+    last_vis_colors = None
+    last_vis_mask01 = None
+
+    with torch.inference_mode():
+        for t in range(config.deploy.max_steps):
+            mask_enabled = bool(config.mask_aware.enabled and args.type == "local")
+            step_colors_for_save = None
+            step_depths_for_save = None
+            step_mask01_for_save = None
+
+            if t % config.deploy.num_inference_steps == 0:
+                # pre-process inputs
+                # colors, depths = agent.get_global_observation()  # for train data debug
+                colors, depths = _load_test_color_depth(test_color, test_depth)  # for train data debug
+                step_colors_for_save = np.asarray(colors, dtype = np.uint8).copy()
+                step_depths_for_save = np.asarray(depths).copy()
+
+                # 本地推理启用 mask-aware 分支
+                mask01, mask_reason, raw_mask = None, None, None
+                if mask_enabled:
+                    mask01, mask_reason, raw_mask = _safe_infer_mask(
+                        color = colors,
+                        # color = test_color,  # for train data debug
+                        depth = depths,
+                        # depth = test_depth,  # for train data debug
+                        proprio = None,
+                        meta = {"step": t, "mode": args.type},
+                        mask_cfg = config.mask_aware,
+                        # agent = agent,
+                    )
+                    # 无论 mask 是否可用，都刷新当前画面，避免窗口图像卡住
+                    last_vis_colors = np.asarray(colors, dtype = np.uint8).copy() # for train data debug
+                    if mask01 is not None:
+                        last_vis_mask01 = np.asarray(mask01, dtype = np.float32).copy()
+                        step_mask01_for_save = last_vis_mask01.copy()
+                    elif last_vis_mask01 is None:
+                        # 首次失败时用空 mask，保证也能刷新到新画面
+                        last_vis_mask01 = np.zeros(depths.shape[:2], dtype = np.float32)
+
+                    if mask01 is None:
+                        reason = mask_reason or "unknown_infer_failure"
+                        if reason in mask_stats:
+                            mask_stats[reason] += 1
+                        if config.mask_aware.infer_none_policy == "fail_fast":
+                            _log_mask_fallback(t, reason, "fail_fast")
+                            raise RuntimeError(f"mask unavailable with fail_fast, reason={reason}")
+                        _log_mask_fallback(t, reason, "no_mask_fallback")
+
+                # 根据 mask 生成点云深度输入
+                depths_for_cloud = depths
+                if mask_enabled and config.mask_aware.enable_3d_filter and mask01 is not None:
+                    depths_for_cloud = depths.copy()
+                    depths_for_cloud[mask01 > 0.5] = 0
+
+                # create cloud inputs
+                create_input_kwargs = dict(
+                    # cam_intrinsics = agent.intrinsics, # for train data debug
+                    cam_intrinsics = fake_intrinsics,  # for train data debug
+                    config = config,
+                    # depth_scale = agent.camera.depth_scale, # for train data debug
+                    depth_scale = 1000.0,  # for train data debug
+                    rescale_factor = 1.0,
+                )
+                coords, points, cloud = create_input(
+                    colors,
+                    depths_for_cloud,
+                    **create_input_kwargs,
+                )
+
+                # 点云出现非法数值时优先回退到原始深度重建
+                if points.size > 0 and (not np.isfinite(points).all()):
+                    if config.mask_aware.empty_cloud_policy == "fail_fast":
+                        _log_mask_fallback(t, "points_nonfinite", "fail_fast")
+                        raise RuntimeError("non-finite points after cloud build")
+                    mask_stats["points_nonfinite"] += 1
+                    _log_mask_fallback(t, "points_nonfinite", "rebuild_from_original_depth")
+                    coords, points, cloud = create_input(
+                        colors,
+                        depths,
+                        **create_input_kwargs,
+                    )
+
+                # 过滤后空点云回退
+                if (
+                    mask_enabled
+                    and config.mask_aware.enable_3d_filter
+                    and mask01 is not None
+                    and points.shape[0] == 0
+                ):
+                    if config.mask_aware.empty_cloud_policy == "fail_fast":
+                        _log_mask_fallback(t, "empty_cloud_after_3d_filter", "fail_fast")
+                        raise RuntimeError("empty cloud after 3d filter")
+                    mask_stats["empty_cloud_skip"] += 1
+                    _log_mask_fallback(t, "empty_cloud_after_3d_filter", "skip_filter_rebuild")
+                    coords, points, cloud = create_input(
+                        colors,
+                        depths,
+                        **create_input_kwargs,
+                    )
+
+                # create image inputs
+                # image_coords = image_processor.get_image_coordinates(depths, agent.intrinsics, agent.camera.depth_scale) # for train data debug
+                image_coords = image_processor.get_image_coordinates(
+                    depths,
+                    fake_intrinsics,  # for train data debug
+                    1000.0,  # for train data debug
+                )
+                colors, image_coords = image_processor.preprocess_images(colors, image_coords)
+
+                # 根据 mask 构建 patch 级可信度权重
+                image_mask_weight = None
+                if mask_enabled and config.mask_aware.enable_2d_reweight and mask01 is not None:
+                    image_mask_weight = _build_image_mask_weight(mask01, image_processor)
+                    if image_mask_weight is None:
+                        mask_stats["reweight_fallback"] += 1
+                        _log_mask_fallback(t, "reweight_build_failed", "disable_2d_reweight")
+                    elif not torch.isfinite(image_mask_weight).all():
+                        mask_stats["weight_nonfinite"] += 1
+                        _log_mask_fallback(t, "reweight_nonfinite", "disable_2d_reweight")
+                        image_mask_weight = None
+
+                # predict action
+                if args.type == "local":
+                    import MinkowskiEngine as ME
+                    coords_batch, feats_batch = create_batch(coords, points)
+                    coords_batch, feats_batch = coords_batch.to(device), feats_batch.to(device)
+                    cloud_data = ME.SparseTensor(feats_batch, coords_batch)
+
+                    colors = colors.unsqueeze(0).to(device)
+                    image_coords = image_coords.unsqueeze(0).to(device)
+                    if image_mask_weight is not None:
+                        image_mask_weight = image_mask_weight.unsqueeze(0).to(device)
+
+                    # predict
+                    pred_raw_action = policy(
+                        cloud_data,
+                        colors,
+                        image_coords,
+                        image_mask_weight = image_mask_weight,
+                        actions = None,
+                    ).squeeze(0).cpu().numpy()
+
+                else:
+                    obs_dict = {
+                        "coords": coords,
+                        "points": points,
+                        "colors": colors.numpy(),
+                        "image_coords": image_coords.numpy()
+                    }
+
+                    pred_raw_action = deepcopy(policy.infer(obs_dict)["actions"])
+
+                # unnormalize predicted actions
+                action = process_state(pred_raw_action, config, to_control = True)
+
+                # visualization
+                if config.deploy.vis and t == 0:
+                    # 旧逻辑：弹窗显示点云 + TCP
+                    # tcp_vis_list = []
+                    # for raw_tcp in action:
+                    #     tcp_vis = o3d.geometry.TriangleMesh.create_sphere(0.01).translate(raw_tcp[:3])
+                    #     tcp_vis_list.append(tcp_vis)
+                    #     if config.robot_type == "dual":
+                    #         tcp_vis_r = o3d.geometry.TriangleMesh.create_sphere(0.01).translate(raw_tcp[10:13])
+                    #         tcp_vis_list.append(tcp_vis_r)
+                    # o3d.visualization.draw_geometries([cloud, *tcp_vis_list])
+                    # input("press enter")
+
+                    tcp_points = []
+                    for raw_tcp in action:
+                        tcp_points.append(raw_tcp[:3])
+                        if config.robot_type == "dual":
+                            tcp_points.append(raw_tcp[10:13])
+
+                    combined_cloud = o3d.geometry.PointCloud()
+                    combined_cloud += cloud
+                    if len(tcp_points) > 0:
+                        tcp_points = np.asarray(tcp_points, dtype = np.float64).reshape(-1, 3)
+                        tcp_cloud = o3d.geometry.PointCloud()
+                        tcp_cloud.points = o3d.utility.Vector3dVector(tcp_points)
+                        tcp_cloud.paint_uniform_color([1.0, 1.0, 0.0])
+                        combined_cloud += tcp_cloud
+
+                    ply_path = os.path.join(vis_save_dir, "cloud_step_{:06d}.ply".format(t))
+                    o3d.io.write_point_cloud(ply_path, combined_cloud)
+                    print("[vis] saved ply: {}".format(ply_path))
+                
+                # project action to base coordinate
+                if config.robot_type == "single":
+                    action_tcp = projector.project_tcp_to_base_coord(action[..., :9], rotation_rep = "rotation_6d")
+                    action = np.concatenate([action_tcp, action[..., 9:10]], axis = -1)
+                else:
+                    action_left_tcp = projector.project_tcp_to_base_coord(action[..., :9], "left", rotation_rep = "rotation_6d")
+                    action_right_tcp = projector.project_tcp_to_base_coord(action[..., 10:19], "right", rotation_rep = "rotation_6d")
+                    action = np.concatenate([action_left_tcp, action[..., 9:10], action_right_tcp, action[..., 19:20]], axis = -1)
+                
+                # add to ensemble buffer
+                ensemble_buffer.add_action(action, t)
+            
+            # 每个 step 都刷新 mask 可视化：
+            # - 推理步使用主流程里已算好的 mask
+            # - 非推理步额外取一次观测并仅用于可视化，不影响动作预测主流程
+            # if getattr(config.deploy, "vis", False) and mask_enabled:
+            #     if t % config.deploy.num_inference_steps != 0:
+            #         try:
+            #             vis_colors, vis_depths = agent.get_global_observation()
+            #             vis_mask01, _, _ = _safe_infer_mask(
+            #                 color = vis_colors,
+            #                 depth = vis_depths,
+            #                 proprio = None,
+            #                 meta = {"step": t, "mode": args.type, "vis_only": True},
+            #                 mask_cfg = config.mask_aware,
+            #                 agent = agent,
+            #             )
+            #             # 每步都更新图像；mask 失败时沿用上一帧（若无则置空）
+            #             last_vis_colors = np.asarray(vis_colors, dtype = np.uint8).copy()
+            #             if step_colors_for_save is None:
+            #                 step_colors_for_save = last_vis_colors.copy()
+            #             if step_depths_for_save is None:
+            #                 step_depths_for_save = np.asarray(vis_depths).copy()
+            #             if vis_mask01 is not None:
+            #                 last_vis_mask01 = np.asarray(vis_mask01, dtype = np.float32).copy()
+            #                 step_mask01_for_save = last_vis_mask01.copy()
+            #             elif last_vis_mask01 is None:
+            #                 last_vis_mask01 = np.zeros(vis_depths.shape[:2], dtype = np.float32)
+            #         except Exception:
+            #             # 可视化失败不影响主推理
+            #             pass
+            #
+            #     if last_vis_colors is not None and last_vis_mask01 is not None:
+            #         _show_mask_visualization_stream(last_vis_colors, last_vis_mask01, t, config)
+            if getattr(config.deploy, "vis", False) and mask_enabled and t == 0:
+                if last_vis_colors is not None and last_vis_mask01 is not None:
+                    _save_mask_visualization(last_vis_colors, last_vis_mask01, t, vis_save_dir)
+
+            if step_colors_for_save is None or step_depths_for_save is None:
+                fallback_colors, fallback_depths = agent.get_global_observation()
+                if step_colors_for_save is None:
+                    step_colors_for_save = np.asarray(fallback_colors, dtype = np.uint8).copy()
+                if step_depths_for_save is None:
+                    step_depths_for_save = np.asarray(fallback_depths).copy()
+
+                if step_mask01_for_save is None and mask_enabled:
+                    fallback_mask01, _, _ = _safe_infer_mask(
+                        color = fallback_colors,
+                        depth = fallback_depths,
+                        proprio = None,
+                        meta = {"step": t, "mode": args.type, "save_only": True},
+                        mask_cfg = config.mask_aware,
+                        agent = agent,
+                    )
+                    if fallback_mask01 is not None:
+                        step_mask01_for_save = np.asarray(fallback_mask01, dtype = np.float32).copy()
+
+            # get step action from ensemble buffer
+            step_action = ensemble_buffer.get_action()
+            # 这个是 config.deploy.num_inference_steps 这么多次循环完成后
+            # 根据 ensemble_buffer 存的一串动作加权平均得到的
+            
+            # 每个 step 都保存：观测图像 + 对应动作向量（无动作时为 NaN 占位）
+            _save_step_observation_action(
+                step_colors_for_save,
+                step_depths_for_save,
+                step_mask01_for_save,
+                step_action,
+                t,
+                rgb_save_dir,
+                depth_save_dir,
+                mask_save_dir,
+                action_save_dir,
+                action_dim_for_save,
+            )
+
+            if step_action is None:   # no action in the buffer => no movement.
+                continue
+            
+            agent.action(step_action, rotation_rep = "rotation_6d")
+            print(f"execute {step_action}")
+            # input("enter")
+
+    print(
+        "[mask-aware] summary infer_none={} infer_exception={} mask_invalid={} "
+        "empty_cloud_skip={} reweight_fallback={} points_nonfinite={} weight_nonfinite={}".format(
+            mask_stats["infer_none"],
+            mask_stats["infer_exception"],
+            mask_stats["mask_invalid"],
+            mask_stats["empty_cloud_skip"],
+            mask_stats["reweight_fallback"],
+            mask_stats["points_nonfinite"],
+            mask_stats["weight_nonfinite"],
+        )
+    )
+
+    # if getattr(config.deploy, "vis", False) and (not _mask_vis_disabled):
+    #     cv2.destroyAllWindows()
+
+    agent.stop()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--type', action = 'store', type = str, help = 'evaluation type, choices: ["local", "remote"].', required = True, choices = ["local", "remote"])
+    parser.add_argument('--calib_airexo', action = 'store', type = str, help = 'airexo calibration path (optional, kept for compatibility)', required = False, default = None)
+    parser.add_argument('--calib_rise2', action = 'store', type = str, help = 'rise2 calibration path', required = True)
+    parser.add_argument('--config', action = 'store', type = str, help = 'data and model config during training and deployment', required = True)
+    parser.add_argument('--ckpt', action = 'store', type = str, help = 'checkpoint path', required = False, default = None)
+    parser.add_argument('--host', action = 'store', type = str, help = 'server host address', required = False, default = "127.0.0.1")
+    parser.add_argument('--port', action = 'store', type = int, help = 'server port', required = False, default = 8000)
+
+    evaluate(vars(parser.parse_args()))

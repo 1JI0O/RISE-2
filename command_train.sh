@@ -15,13 +15,13 @@ export MPLBACKEND=Agg
 # CUDA_VISIBLE_DEVICES=0 torchrun \
 # --master_addr 127.0.0.1 --master_port 23333 \
 # --nproc_per_node 1 --nnodes 1 --node_rank 0 \
-# train_original.py --data_path /data/haoxiang/data/task0012_260321/task0012_toys_basket_converted \
-# --ckpt_dir /data/haoxiang/logs/task0012-ca-pi-xie \
-# --config configs/dual_ca_pi_xie.yaml
+# train.py --data_path /data/haoxiang/data/task0012_260321/task0012_toys_basket_converted \
+# --ckpt_dir /data/haoxiang/logs/task0012-ca-pi-xie-mask-aware \
+# --config configs/dual_ca_pi_xie_mask_aware.yaml
 
 CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun \
 --master_addr 127.0.0.1 --master_port 23333 \
 --nproc_per_node 4 --nnodes 1 --node_rank 0 \
-train_original.py --data_path /data/haoxiang/data/task0012_260321/task0012_toys_basket_converted \
---ckpt_dir /data/haoxiang/logs/task0012-ca-pi-xie \
---config configs/dual_ca_pi_xie.yaml
+train.py --data_path /data/haoxiang/data/task0012_260321/task0012_toys_basket_converted \
+--ckpt_dir /data/haoxiang/logs/task0012-ca-pi-xie-mask-aware \
+--config configs/dual_ca_pi_xie_mask_aware.yaml
