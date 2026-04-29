@@ -3,6 +3,7 @@
 set -euo pipefail
 
 export PYTHONPATH="/home/haoxiang/rise2_mask_aware/airexo:${PYTHONPATH:-}"
+export PYTHONPATH="/home/haoxiang/rise2_mask_aware/easyrobot:${PYTHONPATH}"
 
 python eval_original.py \
 --type local \

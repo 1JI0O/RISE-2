@@ -1,10 +1,4 @@
-"""
-Single-arm device-based evaluation agent for zihao/foar deployment.
-
-This file intentionally follows `eval_agent_zihao_foar.py` much more closely
-than the generic `eval_agent.py` implementation. On the deployment machine,
-`device_zihao/` is expected to appear as the `device/` package.
-"""
+"""Single-arm device-based evaluation agent for zihao/foar deployment."""
 
 from __future__ import annotations
 
@@ -12,8 +6,6 @@ import time
 from typing import Optional
 
 import numpy as np
-from easydict import EasyDict as edict
-
 from device.robot.flexiv_api import FlexivApi
 from device.camera.realsense import RealSenseRGBDCamera
 from flexiv_robot_interface import flexiv_rizon_interface as single
@@ -26,8 +18,10 @@ class SingleArmAgent:
     """
     Device-based single-arm evaluation agent.
 
-    API is adapted for current eval code, but the initialization sequence and
-    device stack intentionally mirror `eval_agent_zihao_foar.py`.
+    On the deployment machine, `device_zihao/` is expected to be mounted as the
+    `device/` package. This implementation intentionally mirrors
+    `eval_agent_zihao_foar.py` as closely as possible while exposing the current
+    eval interfaces.
     """
 
     def __init__(
@@ -40,7 +34,6 @@ class SingleArmAgent:
         init_joint_rad=None,
         init_tcp_pose=None,
         enable_init_tcp_pose=False,
-        max_contact_wrench=[30, 30, 30, 10, 10, 10],
         **kwargs,
     ):
         del gripper_port, gripper_key
@@ -69,11 +62,6 @@ class SingleArmAgent:
             target_tcp = self.ready_pose
         single.move_l_pose(self.robot.robot, pose=target_tcp, is_blocking=True)
         time.sleep(5.0)
-
-        try:
-            self.robot.set_max_contact_wrench(max_contact_wrench)
-        except Exception as exc:
-            print(f"[SingleArmAgent] set_max_contact_wrench skipped: {exc}")
 
         self.camera = RealSenseRGBDCamera(serial=camera_serial)
         for _ in range(30):
@@ -178,13 +166,6 @@ class SingleArmAgent:
         time.sleep(0.02)
         self._gripper_width = 0.0
 
-    def set_gripper_width(self, width, blocking=True):
-        del blocking
-        self._gripper_width = float(width)
-
-    def get_gripper_width(self):
-        return float(self._gripper_width)
-
     def enable_lowdim_provider(self, sample_hz: float = 100.0, buffer_secs: float = 60.0):
         if self._lowdim_provider is not None:
             return
@@ -226,10 +207,6 @@ class SingleArmAgent:
             projector=projector,
             remove_first=bool(remove_first),
         )
-
-    @property
-    def max_steps(self):
-        return 10**9
 
     def stop(self):
         self.robot.stop()

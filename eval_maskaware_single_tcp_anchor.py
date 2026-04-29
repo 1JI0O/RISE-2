@@ -6,6 +6,7 @@ import argparse
 import numpy as np
 import open3d as o3d
 import torchvision.transforms as T
+import torch.nn.functional as F
 import airexo.helpers.urdf_robot as robot_helper
 
 from copy import deepcopy
@@ -19,9 +20,10 @@ from airexo.helpers.constants import (
 
 from utils.training import set_seed
 from utils.ensemble import EnsembleBuffer
-# from remote_eval import WebsocketClientPolicy
-from eval_agent import SingleArmAgent, DualArmAgent
+from remote_eval import WebsocketClientPolicy
+from eval_debug_agent import EvalDebugAgent
 from dataset.data_utils import resize_image, ImageProcessor
+from dataset.data_utils import vis_data
 from dataset.projector import SingleArmProjector, DualArmProjector
 
 import cv2
@@ -50,6 +52,18 @@ default_args = edict(
 
 _arm_renderer = None
 _GRIPPER_KEYWORDS = ("finger", "knuckle", "robotiq", "flange")
+TCP_ANCHOR_OFFSETS_7 = np.asarray(
+    [
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, -1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, -1.0],
+    ],
+    dtype=np.float32,
+)
 
 
 def _warn(msg):
@@ -155,6 +169,150 @@ def _log_mask_aware_summary(mask_cfg):
     )
 
 
+def _build_tcp_anchor_cfg(config):
+    default_cfg = {
+        "enabled": False,
+        "anchor_num_points": 7,
+        "anchor_radius_scale": 0.75,
+        "anchor_color": [0.0, 0.2, 1.0],
+        "patch_weight_mode": "anchor_only",
+        "tcp_patch_radius": 1,
+        "tcp_patch_weight_floor": 1.0,
+        "mask_dilate_kernel": 9,
+    }
+    raw_cfg = getattr(config, "tcp_anchor", {})
+    raw_cfg = dict(raw_cfg) if raw_cfg is not None else {}
+    merged_cfg = deepcopy(default_cfg)
+    for key, value in raw_cfg.items():
+        if value is not None and key in merged_cfg:
+            merged_cfg[key] = value
+
+    merged_cfg["enabled"] = bool(merged_cfg["enabled"])
+    merged_cfg["anchor_num_points"] = int(merged_cfg["anchor_num_points"])
+    merged_cfg["anchor_radius_scale"] = float(merged_cfg["anchor_radius_scale"])
+    merged_cfg["anchor_color"] = np.asarray(
+        merged_cfg["anchor_color"], dtype=np.float32
+    )
+    merged_cfg["patch_weight_mode"] = str(merged_cfg["patch_weight_mode"])
+    merged_cfg["tcp_patch_radius"] = int(merged_cfg["tcp_patch_radius"])
+    merged_cfg["tcp_patch_weight_floor"] = float(merged_cfg["tcp_patch_weight_floor"])
+    merged_cfg["mask_dilate_kernel"] = int(merged_cfg["mask_dilate_kernel"])
+
+    if merged_cfg["anchor_num_points"] != 7:
+        raise ValueError("tcp_anchor currently supports anchor_num_points=7 only")
+    if merged_cfg["anchor_radius_scale"] <= 0:
+        raise ValueError("tcp_anchor anchor_radius_scale must be > 0")
+    if merged_cfg["patch_weight_mode"] not in {"anchor_only"}:
+        raise ValueError(
+            f"Unsupported tcp_anchor patch_weight_mode: {merged_cfg['patch_weight_mode']}"
+        )
+    if merged_cfg["tcp_patch_radius"] < 0:
+        raise ValueError("tcp_anchor tcp_patch_radius must be >= 0")
+    if not (0.0 <= merged_cfg["tcp_patch_weight_floor"] <= 1.0):
+        raise ValueError("tcp_anchor tcp_patch_weight_floor must be in [0, 1]")
+    if (
+        merged_cfg["mask_dilate_kernel"] < 1
+        or merged_cfg["mask_dilate_kernel"] % 2 == 0
+    ):
+        raise ValueError("tcp_anchor mask_dilate_kernel must be a positive odd integer")
+    return edict(merged_cfg)
+
+
+def _log_tcp_anchor_summary(tcp_anchor_cfg):
+    print(
+        "[tcp-anchor] enabled={} num_points={} radius_scale={} patch_mode={} patch_radius={} patch_floor={} dilate_kernel={}".format(
+            tcp_anchor_cfg.enabled,
+            tcp_anchor_cfg.anchor_num_points,
+            tcp_anchor_cfg.anchor_radius_scale,
+            tcp_anchor_cfg.patch_weight_mode,
+            tcp_anchor_cfg.tcp_patch_radius,
+            tcp_anchor_cfg.tcp_patch_weight_floor,
+            tcp_anchor_cfg.mask_dilate_kernel,
+        )
+    )
+
+
+def _dilate_mask01(mask01, kernel_size):
+    if mask01 is None or kernel_size <= 1:
+        return mask01
+    mask_t = torch.from_numpy(mask01).to(torch.float32).unsqueeze(0).unsqueeze(0)
+    pad = kernel_size // 2
+    dilated = F.max_pool2d(mask_t, kernel_size=kernel_size, stride=1, padding=pad)
+    return dilated[0, 0].cpu().numpy().astype(np.float32)
+
+
+def _build_tcp_anchor_points(tcp_camera, voxel_size, radius_scale):
+    radius = float(voxel_size * radius_scale)
+    offsets = TCP_ANCHOR_OFFSETS_7 * radius
+    return offsets + np.asarray(tcp_camera[:3], dtype=np.float32)[None, :]
+
+
+def _project_point_to_patch_coord(
+    point_xyz, intrinsics, orig_shape, img_size, img_coord_size
+):
+    z = float(point_xyz[2])
+    if z <= 1e-6:
+        return None
+    fx, fy = float(intrinsics[0, 0]), float(intrinsics[1, 1])
+    cx, cy = float(intrinsics[0, 2]), float(intrinsics[1, 2])
+    u = fx * float(point_xyz[0]) / z + cx
+    v = fy * float(point_xyz[1]) / z + cy
+    h0, w0 = int(orig_shape[0]), int(orig_shape[1])
+    if u < 0 or u >= w0 or v < 0 or v >= h0:
+        return None
+    h1, w1 = int(img_size[0]), int(img_size[1])
+    ph, pw = int(img_coord_size[0]), int(img_coord_size[1])
+    u_resized = u * (w1 / max(w0, 1))
+    v_resized = v * (h1 / max(h0, 1))
+    patch_j = int(np.clip(np.floor(u_resized * pw / max(w1, 1)), 0, pw - 1))
+    patch_i = int(np.clip(np.floor(v_resized * ph / max(h1, 1)), 0, ph - 1))
+    return patch_i, patch_j
+
+
+def _restore_tcp_patch_weight(
+    image_mask_weight,
+    tcp_camera,
+    intrinsics,
+    orig_shape,
+    image_processor,
+    tcp_anchor_cfg,
+):
+    if image_mask_weight is None or tcp_camera is None or not tcp_anchor_cfg.enabled:
+        return image_mask_weight
+    patch_coord = _project_point_to_patch_coord(
+        tcp_camera[:3],
+        intrinsics,
+        orig_shape,
+        image_processor.img_size,
+        image_processor.image_coord_pooling.output_size,
+    )
+    if patch_coord is None:
+        return image_mask_weight
+    patch_i, patch_j = patch_coord
+    h, w = image_mask_weight.shape[-2], image_mask_weight.shape[-1]
+    for i in range(
+        max(0, patch_i - tcp_anchor_cfg.tcp_patch_radius),
+        min(h, patch_i + tcp_anchor_cfg.tcp_patch_radius + 1),
+    ):
+        for j in range(
+            max(0, patch_j - tcp_anchor_cfg.tcp_patch_radius),
+            min(w, patch_j + tcp_anchor_cfg.tcp_patch_radius + 1),
+        ):
+            image_mask_weight[0, i, j] = max(
+                float(image_mask_weight[0, i, j]),
+                tcp_anchor_cfg.tcp_patch_weight_floor,
+            )
+    return image_mask_weight
+
+
+def _get_tcp_camera(agent, projector):
+    proprio = agent.get_proprio(rotation_rep="quaternion")
+    tcp_base = np.asarray(proprio[:8], dtype=np.float32)
+    return projector.project_tcp_to_camera_coord(
+        tcp_base[:7], rotation_rep="quaternion"
+    )
+
+
 def _save_mask_debug(colors, mask01, step, mask_cfg):
     out_dir = os.path.abspath(mask_cfg.debug_dir)
     os.makedirs(out_dir, exist_ok=True)
@@ -194,13 +352,77 @@ def _save_mask_debug(colors, mask01, step, mask_cfg):
             )
 
 
-class NoGripperSeparateRobotRenderer:
+def _save_cloud_debug_ply(
+    cloud, full_points, action_tcps, save_dir, save_prefix, anchor_num_points=0
+):
+    save_dir = os.path.abspath(save_dir)
+    os.makedirs(save_dir, exist_ok=True)
+    cloud_vis = o3d.geometry.PointCloud()
+    cloud_vis.points = o3d.utility.Vector3dVector(np.asarray(cloud.points))
+    cloud_vis.colors = o3d.utility.Vector3dVector(np.asarray(cloud.colors))
+
+    combined = o3d.geometry.PointCloud()
+    combined += cloud_vis
+
+    full_points = np.asarray(full_points, dtype=np.float32)
+    anchor_num_points = int(anchor_num_points)
+    if anchor_num_points > 0 and full_points.shape[0] >= anchor_num_points:
+        anchor_pts = full_points[-anchor_num_points:]
+        anchor_radius = 0.006
+        anchor_offsets = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [anchor_radius, 0.0, 0.0],
+                [-anchor_radius, 0.0, 0.0],
+                [0.0, anchor_radius, 0.0],
+                [0.0, -anchor_radius, 0.0],
+                [0.0, 0.0, anchor_radius],
+                [0.0, 0.0, -anchor_radius],
+            ],
+            dtype=np.float32,
+        )
+        anchor_pts_big = (anchor_pts[:, None, :] + anchor_offsets[None, :, :]).reshape(
+            -1, 3
+        )
+        anchor_pcd = o3d.geometry.PointCloud()
+        anchor_pcd.points = o3d.utility.Vector3dVector(anchor_pts_big)
+        anchor_pcd.paint_uniform_color([0.0, 0.2, 1.0])
+        combined += anchor_pcd
+
+    action_tcps = np.asarray(action_tcps, dtype=np.float32)
+    if action_tcps.size > 0:
+        tcp_pts = action_tcps[:, :3]
+        tcp_radius = 0.01
+        tcp_offsets = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [tcp_radius, 0.0, 0.0],
+                [-tcp_radius, 0.0, 0.0],
+                [0.0, tcp_radius, 0.0],
+                [0.0, -tcp_radius, 0.0],
+                [0.0, 0.0, tcp_radius],
+                [0.0, 0.0, -tcp_radius],
+            ],
+            dtype=np.float32,
+        )
+        tcp_pts_big = (tcp_pts[:, None, :] + tcp_offsets[None, :, :]).reshape(-1, 3)
+        tcp_pcd = o3d.geometry.PointCloud()
+        tcp_pcd.points = o3d.utility.Vector3dVector(tcp_pts_big)
+        tcp_pcd.paint_uniform_color([1.0, 1.0, 0.0])
+        combined += tcp_pcd
+
+    ply_path = os.path.join(save_dir, f"{save_prefix}.ply")
+    ok = o3d.io.write_point_cloud(ply_path, combined)
+    if not ok:
+        raise RuntimeError(f"failed to write point cloud: {ply_path}")
+    print(f"[vis] saved ply: {ply_path}")
+
+
+class SingleArmNoGripperRenderer:
     def __init__(
         self,
-        left_joint_cfgs,
-        right_joint_cfgs,
-        cam_to_left_base,
-        cam_to_right_base,
+        joint_cfgs,
+        cam_to_base,
         intrinsic,
         width=1280,
         height=720,
@@ -209,27 +431,13 @@ class NoGripperSeparateRobotRenderer:
         urdf_file=None,
     ):
         if urdf_file is None:
-            urdf_file = {
-                "left": os.path.join(
-                    "airexo", "airexo", "urdf_models", "robot", "left_robot_inhand.urdf"
-                ),
-                "right": os.path.join(
-                    "airexo",
-                    "airexo",
-                    "urdf_models",
-                    "robot",
-                    "right_robot_inhand.urdf",
-                ),
-            }
+            urdf_file = os.path.join(
+                "airexo", "airexo", "urdf_models", "robot_old", "left_robot.urdf"
+            )
 
-        self.left_joint_cfgs = left_joint_cfgs
-        self.right_joint_cfgs = right_joint_cfgs
-        self.cam_to_left_base = np.asarray(cam_to_left_base, dtype=np.float64)
-        self.cam_to_right_base = np.asarray(cam_to_right_base, dtype=np.float64)
-        self.urdf_file = {
-            "left": str(urdf_file["left"]),
-            "right": str(urdf_file["right"]),
-        }
+        self.joint_cfgs = joint_cfgs
+        self.cam_to_base = np.asarray(cam_to_base, dtype=np.float64)
+        self.urdf_file = str(urdf_file)
 
         self.renderer = o3d.visualization.rendering.OffscreenRenderer(
             int(width), int(height)
@@ -237,47 +445,32 @@ class NoGripperSeparateRobotRenderer:
         self.material = o3d.visualization.rendering.MaterialRecord()
         self.material.shader = "defaultLit"
 
-        cur_transforms_left, self.visuals_map_left = (
-            robot_helper.forward_kinematic_single(
-                joint=np.zeros((self.left_joint_cfgs.num_joints,), dtype=np.float32),
-                joint_cfgs=self.left_joint_cfgs,
-                is_rad=True,
-                urdf_file=self.urdf_file["left"],
-                with_visuals_map=True,
-            )
-        )
-        cur_transforms_right, self.visuals_map_right = (
-            robot_helper.forward_kinematic_single(
-                joint=np.zeros((self.right_joint_cfgs.num_joints,), dtype=np.float32),
-                joint_cfgs=self.right_joint_cfgs,
-                is_rad=True,
-                urdf_file=self.urdf_file["right"],
-                with_visuals_map=True,
-            )
+        cur_transforms, self.visuals_map = robot_helper.forward_kinematic_single(
+            joint=np.zeros((self.joint_cfgs.num_joints,), dtype=np.float32),
+            joint_cfgs=self.joint_cfgs,
+            is_rad=True,
+            urdf_file=self.urdf_file,
+            with_visuals_map=True,
         )
 
-        self.model_meshes_left = {}
-        self.last_transforms_left = {}
-        self.model_meshes_right = {}
-        self.last_transforms_right = {}
-        self._init_side_meshes(
-            "left",
-            cur_transforms_left,
-            self.visuals_map_left,
-            self.cam_to_left_base,
-            self.urdf_file["left"],
-            self.model_meshes_left,
-            self.last_transforms_left,
-        )
-        self._init_side_meshes(
-            "right",
-            cur_transforms_right,
-            self.visuals_map_right,
-            self.cam_to_right_base,
-            self.urdf_file["right"],
-            self.model_meshes_right,
-            self.last_transforms_right,
-        )
+        self.model_meshes = {}
+        self.last_transforms = {}
+        for link, transform in cur_transforms.items():
+            if not self._should_keep_link(link):
+                continue
+            for visual in self.visuals_map[link]:
+                if visual.geom_param is None:
+                    continue
+                mesh_name = f"single///{link}///{visual.geom_param}"
+                tf = self._compose_tf(self.cam_to_base, transform, visual.offset)
+                mesh = o3d.io.read_triangle_mesh(
+                    os.path.join(os.path.dirname(self.urdf_file), visual.geom_param)
+                )
+                mesh.transform(tf)
+                mesh.compute_vertex_normals()
+                self.model_meshes[mesh_name] = mesh
+                self.last_transforms[mesh_name] = tf
+                self.renderer.scene.add_geometry(mesh_name, mesh, self.material)
 
         self.renderer.scene.camera.set_projection(
             np.asarray(intrinsic, dtype=np.float64),
@@ -289,10 +482,12 @@ class NoGripperSeparateRobotRenderer:
 
     @staticmethod
     def _should_keep_link(link_name):
-        link_name = str(link_name).lower()
-        return not any(keyword in link_name for keyword in _GRIPPER_KEYWORDS)
+        return not any(
+            keyword in str(link_name).lower() for keyword in _GRIPPER_KEYWORDS
+        )
 
-    def _compose_tf(self, cam_to_base, transform, offset):
+    @staticmethod
+    def _compose_tf(cam_to_base, transform, offset):
         return (
             np.asarray(O3D_RENDER_TRANSFORMATION, dtype=np.float64)
             @ np.asarray(cam_to_base, dtype=np.float64)
@@ -301,83 +496,31 @@ class NoGripperSeparateRobotRenderer:
             @ offset.matrix()
         )
 
-    def _init_side_meshes(
-        self,
-        side,
-        cur_transforms,
-        visuals_map,
-        cam_to_base,
-        urdf_file,
-        mesh_store,
-        tf_store,
-    ):
-        for link, transform in cur_transforms.items():
-            if not self._should_keep_link(link):
-                continue
-            for visual in visuals_map[link]:
-                if visual.geom_param is None:
-                    continue
-                mesh_name = f"{side}///{link}///{visual.geom_param}"
-                tf = self._compose_tf(cam_to_base, transform, visual.offset)
-                mesh = o3d.io.read_triangle_mesh(
-                    os.path.join(os.path.dirname(urdf_file), visual.geom_param)
-                )
-                mesh.transform(tf)
-                mesh.compute_vertex_normals()
-                mesh_store[mesh_name] = mesh
-                tf_store[mesh_name] = tf
-                self.renderer.scene.add_geometry(mesh_name, mesh, self.material)
-
-    def update_joints(self, left_joint, right_joint):
-        cur_transforms_left = robot_helper.forward_kinematic_single(
-            joint=np.asarray(left_joint, dtype=np.float32),
-            joint_cfgs=self.left_joint_cfgs,
+    def update_joints(self, joint):
+        cur_transforms = robot_helper.forward_kinematic_single(
+            joint=np.asarray(joint, dtype=np.float32),
+            joint_cfgs=self.joint_cfgs,
             is_rad=True,
-            urdf_file=self.urdf_file["left"],
-            with_visuals_map=False,
-        )
-        cur_transforms_right = robot_helper.forward_kinematic_single(
-            joint=np.asarray(right_joint, dtype=np.float32),
-            joint_cfgs=self.right_joint_cfgs,
-            is_rad=True,
-            urdf_file=self.urdf_file["right"],
+            urdf_file=self.urdf_file,
             with_visuals_map=False,
         )
 
         self.renderer.scene.clear_geometry()
-
-        for link, transform in cur_transforms_left.items():
+        for link, transform in cur_transforms.items():
             if not self._should_keep_link(link):
                 continue
-            for visual in self.visuals_map_left[link]:
+            for visual in self.visuals_map[link]:
                 if visual.geom_param is None:
                     continue
-                mesh_name = f"left///{link}///{visual.geom_param}"
-                tf = self._compose_tf(self.cam_to_left_base, transform, visual.offset)
-                self.model_meshes_left[mesh_name].transform(
-                    tf @ np.linalg.inv(self.last_transforms_left[mesh_name])
+                mesh_name = f"single///{link}///{visual.geom_param}"
+                tf = self._compose_tf(self.cam_to_base, transform, visual.offset)
+                self.model_meshes[mesh_name].transform(
+                    tf @ np.linalg.inv(self.last_transforms[mesh_name])
                 )
-                self.model_meshes_left[mesh_name].compute_vertex_normals()
-                self.last_transforms_left[mesh_name] = tf
+                self.model_meshes[mesh_name].compute_vertex_normals()
+                self.last_transforms[mesh_name] = tf
                 self.renderer.scene.add_geometry(
-                    mesh_name, self.model_meshes_left[mesh_name], self.material
-                )
-
-        for link, transform in cur_transforms_right.items():
-            if not self._should_keep_link(link):
-                continue
-            for visual in self.visuals_map_right[link]:
-                if visual.geom_param is None:
-                    continue
-                mesh_name = f"right///{link}///{visual.geom_param}"
-                tf = self._compose_tf(self.cam_to_right_base, transform, visual.offset)
-                self.model_meshes_right[mesh_name].transform(
-                    tf @ np.linalg.inv(self.last_transforms_right[mesh_name])
-                )
-                self.model_meshes_right[mesh_name].compute_vertex_normals()
-                self.last_transforms_right[mesh_name] = tf
-                self.renderer.scene.add_geometry(
-                    mesh_name, self.model_meshes_right[mesh_name], self.material
+                    mesh_name, self.model_meshes[mesh_name], self.material
                 )
 
     def render_depth(self):
@@ -420,6 +563,8 @@ def _load_intrinsic_from_npy(path, selector="first"):
     data = np.load(path, allow_pickle=True)
     if isinstance(data, np.ndarray) and data.shape == ():
         data = data.item()
+    if not isinstance(data, dict):
+        raise TypeError(f"intrinsics npy must contain a dict, got {type(data)}")
     if selector == "first":
         selector = sorted(data.keys())[0]
     elif selector == "mean":
@@ -462,39 +607,30 @@ def _init_mask_renderer(mask_cfg, agent):
         return None
 
     json_cfg = mask_cfg.json_mask
-    if json_cfg.left_json is None or json_cfg.right_json is None:
-        _warn("json mask enabled but left_json/right_json is missing; disable renderer")
+    single_json = getattr(json_cfg, "single_json", None)
+    if single_json is None:
+        single_json = getattr(json_cfg, "left_json", None)
+    single_urdf = getattr(json_cfg, "single_urdf", None)
+    if single_urdf is None:
+        single_urdf = getattr(json_cfg, "left_urdf", None)
+
+    if single_json is None or single_urdf is None:
+        _warn("json mask enabled for single arm but single_json/single_urdf is missing")
         return None
 
     try:
-        left_json = _load_json_pose(json_cfg.left_json)
-        right_json = _load_json_pose(json_cfg.right_json)
-        left_cam_to_base = _cam_base_from_json(
-            left_json, json_cfg.cam_base_mode
-        ).astype(np.float32)
-        right_cam_to_base = _cam_base_from_json(
-            right_json, json_cfg.cam_base_mode
+        single_json_pose = _load_json_pose(single_json)
+        cam_to_base = _cam_base_from_json(
+            single_json_pose, json_cfg.cam_base_mode
         ).astype(np.float32)
         intrinsic, intrinsic_source = _load_agent_intrinsic(agent, json_cfg)
 
-        left_cfg = edict(
-            yaml.safe_load(
-                open(
-                    os.path.join(
-                        "airexo", "airexo", "configs", "joint", "left", "robot.yaml"
-                    )
-                )
-            )
-        )
-        right_cfg = edict(
-            yaml.safe_load(
-                open(
-                    os.path.join(
-                        "airexo", "airexo", "configs", "joint", "right", "robot.yaml"
-                    )
-                )
-            )
-        )
+        with open(
+            os.path.join("airexo", "airexo", "configs", "joint", "left", "robot.yaml"),
+            "r",
+            encoding="utf-8",
+        ) as f:
+            joint_cfg = edict(yaml.safe_load(f))
 
         render_width = int(json_cfg.width)
         render_height = int(json_cfg.height)
@@ -507,29 +643,24 @@ def _init_mask_renderer(mask_cfg, agent):
                 render_width = inferred_width
                 render_height = inferred_height
 
-        renderer = NoGripperSeparateRobotRenderer(
-            left_joint_cfgs=left_cfg,
-            right_joint_cfgs=right_cfg,
-            cam_to_left_base=left_cam_to_base,
-            cam_to_right_base=right_cam_to_base,
+        renderer = SingleArmNoGripperRenderer(
+            joint_cfgs=joint_cfg,
+            cam_to_base=cam_to_base,
             intrinsic=intrinsic,
             width=render_width,
             height=render_height,
             near_plane=float(json_cfg.near_plane),
             far_plane=float(json_cfg.far_plane),
-            urdf_file={
-                "left": str(json_cfg.left_urdf),
-                "right": str(json_cfg.right_urdf),
-            },
+            urdf_file=str(single_urdf),
         )
         print(
-            "[mask-aware/json] renderer initialized "
+            "[mask-aware/json-single] renderer initialized "
             f"(cam_mode={json_cfg.cam_base_mode}, intrinsic={intrinsic_source}, "
-            f"left_json={json_cfg.left_json}, right_json={json_cfg.right_json})"
+            f"single_json={single_json}, single_urdf={single_urdf})"
         )
         return renderer
     except Exception as exc:
-        _warn(f"renderer init failed: {exc}")
+        _warn(f"single-arm renderer init failed: {exc}")
         return None
 
 
@@ -537,65 +668,36 @@ def _extract_joint_pair(agent, robot_type):
     if agent is None:
         return None
 
-    if (
-        robot_type == "dual"
-        and hasattr(agent, "left_robot")
-        and hasattr(agent, "right_robot")
-    ):
+    if robot_type == "single" and hasattr(agent, "_load_joint_from_h5"):
         try:
-            left_joint_pos = np.asarray(
-                agent.left_robot.get_joint_pos(), dtype=np.float32
-            ).reshape(-1)
-            right_joint_pos = np.asarray(
-                agent.right_robot.get_joint_pos(), dtype=np.float32
-            ).reshape(-1)
-            left_gripper_width = np.asarray(
-                agent.left_gripper.get_states()["width"], dtype=np.float32
-            ).reshape(-1)
-            right_gripper_width = np.asarray(
-                agent.right_gripper.get_states()["width"], dtype=np.float32
-            ).reshape(-1)
-
-            if left_joint_pos.size < 7 or right_joint_pos.size < 7:
-                _warn(
-                    "dual-arm joint length mismatch: "
-                    f"left={left_joint_pos.size}, right={right_joint_pos.size}"
-                )
-                return None
-            if left_gripper_width.size < 1 or right_gripper_width.size < 1:
-                _warn(
-                    "dual-arm gripper width length mismatch: "
-                    f"left={left_gripper_width.size}, right={right_gripper_width.size}"
-                )
-                return None
-
-            left_joint = np.concatenate(
-                [left_joint_pos[:7], left_gripper_width[:1]], axis=0
-            )
-            right_joint = np.concatenate(
-                [right_joint_pos[:7], right_gripper_width[:1]], axis=0
-            )
-            return left_joint, right_joint
+            if getattr(agent, "_last_frame_id", None) is None and hasattr(
+                agent, "_select_frame_id"
+            ):
+                agent._last_frame_id = agent._select_frame_id()
+            single_joint, _ = agent._load_joint_from_h5(agent._last_frame_id)
+            return single_joint, None
         except Exception as exc:
-            _warn(f"failed to read dual-arm joints from raw agent API: {exc}")
-            return None
+            _warn(f"failed to read single-arm joints from debug h5: {exc}")
 
-    if not hasattr(agent, "get_proprio"):
-        return None
-    try:
-        _, proprio_joint = agent.get_proprio(with_joint=True)
-    except Exception as exc:
-        _warn(f"failed to read joints from agent: {exc}")
-        return None
-
-    proprio_joint = np.asarray(proprio_joint, dtype=np.float32).reshape(-1)
-    if robot_type == "single":
-        if proprio_joint.size < 8:
-            return None
-        return proprio_joint[:8], None
-    if proprio_joint.size < 16:
-        return None
-    return proprio_joint[:8], proprio_joint[8:16]
+    if hasattr(agent, "robot") and hasattr(agent, "gripper"):
+        try:
+            joint_pos = np.asarray(
+                agent.robot.get_joint_pos(), dtype=np.float32
+            ).reshape(-1)
+            gripper_state = agent.gripper.get_states()
+            gripper_width = np.asarray(
+                gripper_state["width"], dtype=np.float32
+            ).reshape(-1)
+            if joint_pos.size < 7:
+                _warn(f"single-arm joint length mismatch: joint={joint_pos.size}")
+                return None
+            if gripper_width.size < 1:
+                _warn("single-arm gripper width length mismatch: width=0")
+                return None
+            single_joint = np.concatenate([joint_pos[:7], gripper_width[:1]], axis=0)
+            return single_joint, None
+        except Exception as exc:
+            _warn(f"failed to read single-arm joints from raw agent API: {exc}")
 
 
 def _normalize_mask(mask, depth_shape, mask_cfg):
@@ -640,14 +742,12 @@ def _infer_mask(agent, depth_shape, mask_cfg, step, robot_type):
         return None, "joint_unavailable"
 
     try:
-        if robot_type == "single":
-            return None, "single_robot_json_mask_not_supported"
-        left_joint, right_joint = joints
-        _arm_renderer.update_joints(left_joint, right_joint)
+        single_joint, _ = joints
+        _arm_renderer.update_joints(single_joint)
         raw_mask = _arm_renderer.render_mask()
         return _normalize_mask(raw_mask, depth_shape, mask_cfg), None
     except Exception as exc:
-        return None, f"render_failed: {exc}"
+        return None, f"single_render_failed: {exc}"
 
 
 def _build_image_mask_weight(mask01, image_processor):
@@ -662,8 +762,37 @@ def _build_image_mask_weight(mask01, image_processor):
     return image_mask_weight
 
 
+def create_input_with_anchor(
+    colors,
+    depths,
+    cam_intrinsics,
+    config,
+    tcp_camera,
+    depth_scale=1000.0,
+    rescale_factor=1.0,
+):
+    cloud = create_point_cloud(
+        colors,
+        depths,
+        cam_intrinsics,
+        config,
+        depth_scale=depth_scale,
+        rescale_factor=rescale_factor,
+    )
+    points = np.asarray(cloud.points)
+    if tcp_camera is not None and config.tcp_anchor.enabled:
+        anchor_points = _build_tcp_anchor_points(
+            tcp_camera,
+            voxel_size=config.data.voxel_size,
+            radius_scale=config.tcp_anchor.anchor_radius_scale,
+        ).astype(np.float32)
+        points = np.concatenate([points, anchor_points], axis=0)
+    coords = np.ascontiguousarray(points / config.data.voxel_size, dtype=np.int32)
+    return coords, points, cloud
+
+
 def create_point_cloud(
-    colors, depths, intrinsics, config, depth_scale=1000.0, rescale_factor=1
+    colors, depths, intrinsics, config, depth_scale=1000.0, rescale_factor=1.0
 ):
     if rescale_factor != 1:
         H, W = depths.shape
@@ -701,7 +830,13 @@ def create_point_cloud(
 
 
 def create_input(
-    colors, depths, cam_intrinsics, config, depth_scale=1000.0, rescale_factor=1
+    colors,
+    depths,
+    cam_intrinsics,
+    config,
+    depth_scale=1000.0,
+    rescale_factor=1.0,
+    tcp_camera=None,
 ):
     cloud = create_point_cloud(
         colors,
@@ -836,6 +971,7 @@ def evaluate(args_override):
         config.data.normalization.trans_max
     )
     config.mask_aware = _build_mask_aware_cfg(config)
+    config.tcp_anchor = _build_tcp_anchor_cfg(config)
 
     set_seed(config.deploy.seed)
 
@@ -897,6 +1033,7 @@ def evaluate(args_override):
 
     agent = _build_agent(args, config)
     _log_mask_aware_summary(config.mask_aware)
+    _log_tcp_anchor_summary(config.tcp_anchor)
 
     global _arm_renderer
     _arm_renderer = (
@@ -936,6 +1073,21 @@ def evaluate(args_override):
                         except Exception as exc:
                             _warn(f"step={t} failed to save mask debug images: {exc}")
 
+                if config.tcp_anchor.enabled and mask01 is not None:
+                    mask01 = _dilate_mask01(
+                        mask01, config.tcp_anchor.mask_dilate_kernel
+                    )
+
+                tcp_camera = None
+                if config.tcp_anchor.enabled:
+                    try:
+                        tcp_camera = _get_tcp_camera(agent, projector)
+                    except Exception as exc:
+                        _warn(
+                            f"step={t} failed to get tcp camera pose, continue without tcp anchor: {exc}"
+                        )
+                        tcp_camera = None
+
                 depths_for_cloud = depths
                 if (
                     config.mask_aware.enabled
@@ -945,11 +1097,18 @@ def evaluate(args_override):
                     depths_for_cloud = depths.copy()
                     depths_for_cloud[mask01 > 0.5] = 0
 
-                coords, points, cloud = create_input(
+                create_input_fn = (
+                    create_input_with_anchor
+                    if config.tcp_anchor.enabled
+                    else create_input
+                )
+
+                coords, points, cloud = create_input_fn(
                     colors,
                     depths_for_cloud,
                     cam_intrinsics=agent.intrinsics,
                     config=config,
+                    tcp_camera=tcp_camera,
                     depth_scale=agent.camera.depth_scale,
                     rescale_factor=1.0,
                 )
@@ -958,11 +1117,12 @@ def evaluate(args_override):
                     _warn(
                         f"step={t} cloud contains non-finite values after mask filtering; rebuild from original depth"
                     )
-                    coords, points, cloud = create_input(
+                    coords, points, cloud = create_input_fn(
                         colors,
                         depths,
                         cam_intrinsics=agent.intrinsics,
                         config=config,
+                        tcp_camera=tcp_camera,
                         depth_scale=agent.camera.depth_scale,
                         rescale_factor=1.0,
                     )
@@ -972,11 +1132,12 @@ def evaluate(args_override):
                         _warn(
                             f"step={t} cloud becomes empty after mask filtering; rebuild from original depth"
                         )
-                        coords, points, cloud = create_input(
+                        coords, points, cloud = create_input_fn(
                             colors,
                             depths,
                             cam_intrinsics=agent.intrinsics,
                             config=config,
+                            tcp_camera=tcp_camera,
                             depth_scale=agent.camera.depth_scale,
                             rescale_factor=1.0,
                         )
@@ -1002,6 +1163,15 @@ def evaluate(args_override):
                         image_mask_weight = _build_image_mask_weight(
                             mask01, image_processor
                         )
+                        if tcp_camera is not None and config.tcp_anchor.enabled:
+                            image_mask_weight = _restore_tcp_patch_weight(
+                                image_mask_weight,
+                                tcp_camera,
+                                agent.intrinsics,
+                                depths.shape[:2],
+                                image_processor,
+                                config.tcp_anchor,
+                            )
                     except Exception as exc:
                         _warn(
                             f"step={t} failed to build image_mask_weight, continue without it: {exc}"
@@ -1045,20 +1215,39 @@ def evaluate(args_override):
                 action = process_state(pred_raw_action, config, to_control=True)
 
                 if config.deploy.vis:
-                    tcp_vis_list = []
-                    for raw_tcp in action:
-                        tcp_vis_list.append(
-                            o3d.geometry.TriangleMesh.create_sphere(0.01).translate(
-                                raw_tcp[:3]
+                    vis_save_dir = getattr(config.deploy, "vis_save_dir", ".")
+                    if vis_save_dir is None or len(str(vis_save_dir).strip()) == 0:
+                        vis_save_dir = "."
+                    os.makedirs(vis_save_dir, exist_ok=True)
+                    vis_prefix = "debug_frame_{}_step_{:06d}".format(
+                        getattr(agent, "_last_frame_id", t), t
+                    )
+                    try:
+                        if config.robot_type == "single":
+                            vis_action_tcps = np.asarray(
+                                action[..., :9], dtype=np.float32
                             )
-                        )
-                        if config.robot_type == "dual":
-                            tcp_vis_list.append(
-                                o3d.geometry.TriangleMesh.create_sphere(0.01).translate(
-                                    raw_tcp[10:13]
-                                )
+                        else:
+                            vis_left = np.asarray(action[..., :9], dtype=np.float32)
+                            vis_right = np.asarray(action[..., 10:19], dtype=np.float32)
+                            vis_action_tcps = np.concatenate(
+                                [vis_left, vis_right], axis=0
                             )
-                    o3d.visualization.draw_geometries([cloud, *tcp_vis_list])
+                        if bool(getattr(config.deploy, "vis_save_ply", False)):
+                            _save_cloud_debug_ply(
+                                cloud=cloud,
+                                full_points=points,
+                                action_tcps=vis_action_tcps,
+                                save_dir=vis_save_dir,
+                                save_prefix=vis_prefix,
+                                anchor_num_points=(
+                                    config.tcp_anchor.anchor_num_points
+                                    if config.tcp_anchor.enabled
+                                    else 0
+                                ),
+                            )
+                    except Exception as exc:
+                        _warn(f"step={t} failed to save vis artifacts: {repr(exc)}")
 
                 if config.robot_type == "single":
                     action_tcp = projector.project_tcp_to_base_coord(

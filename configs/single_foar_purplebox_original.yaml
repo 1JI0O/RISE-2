@@ -66,6 +66,7 @@ deploy:
     inhand_camera_serial: unknown_inhand
     gripper_port: /dev/ttyUSB0
     gripper_key: width
+    gripper_self_test: false
 
   max_steps: 3000
   num_inference_steps: 20

@@ -4,10 +4,10 @@ Evaluation Agent.
 
 import time
 import numpy as np
-from easyrobot.arm.flexiv import FlexivArm
-from easyrobot.camera.realsense import RealSenseRGBDCamera
+from easyrobot.easyrobot.arm.flexiv import FlexivArm
+from easyrobot.easyrobot.camera.realsense import RealSenseRGBDCamera
 from utils.transformation import xyz_rot_transform
-from easyrobot.gripper.flexiv import FlexivGripper
+from easyrobot.easyrobot.gripper.flexiv import FlexivGripper
 
 
 TELEOP_INIT_POSES = {
@@ -53,22 +53,22 @@ TELEOP_INIT_POSES = {
     },
     "Rizon4-062770": {
         "joint_pose_deg": [
-            40.56328795231722,
-            -69.42497970535271,
-            25.268527306177706,
-            57.00907890757645,
-            -44.02291537071208,
-            -6.85728154224243,
-            -25.53056751368525,
+            39.877,
+            -64.683,
+            27.603,
+            67.212,
+            -43.0428,
+            -4.469,
+            -19.715,
         ],
         "cartesian_pose": [
-            0.5733851194381714,
-            0.36712610721588135,
-            0.03125756233930588,
-            0.2566128969192505,
-            0.6856741905212402,
-            -0.6372119784355164,
-            0.2407522052526474,
+            0.5228249073028564,
+            0.36680,
+            0.0325,
+            0.2565673291683197,
+            0.6857561469078064,
+            -0.6372485160827637,
+            0.2404704988002777,
         ],
     },
 }

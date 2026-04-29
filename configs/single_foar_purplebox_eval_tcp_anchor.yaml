@@ -74,7 +74,11 @@ deploy:
   gripper_threshold: 0.02
   ensemble_mode: new
   seed: 233
-  vis: false
+  vis: true
+  vis_save_dir: /data/haoxiang/logs/single_foar_purplebox_tcp_anchor/eval_debug_vis
+  vis_save_png: false
+  vis_save_ply: true
+  vis_force_offscreen: true
 
 mask_aware:
   enabled: true
@@ -84,7 +88,7 @@ mask_aware:
   mask_white_is_untrusted: true
   debug_save_mask: true
   debug_save_every: 1
-  debug_dir: /data/haoxiang/logs/single_foar_purplebox_mask_aware/eval_json_debug_masks
+  debug_dir: /data/haoxiang/logs/single_foar_purplebox_tcp_anchor/eval_debug_masks
   debug_print_stats: true
   r_min: 0.001
   interp_eps: 0.000001
@@ -97,11 +101,21 @@ mask_aware:
     use_agent_intrinsics: true
     intrinsics_npy: null
     intrinsic_selector: first
-    single_urdf: airexo/airexo/urdf_models/zihao_single_worldbase_y_neg90/left_robot.urdf
+    single_urdf: airexo/airexo/urdf_models/zihao_single_worldbase_y_neg90/left_robot_grav.urdf
     width: 1280
     height: 720
     near_plane: 0.01
     far_plane: 100.0
+
+tcp_anchor:
+  enabled: true
+  anchor_num_points: 7
+  anchor_radius_scale: 0.75
+  anchor_color: [0.0, 0.2, 1.0]
+  patch_weight_mode: anchor_only
+  tcp_patch_radius: 1
+  tcp_patch_weight_floor: 1.0
+  mask_dilate_kernel: 9
 
 model:
   image_enc: dinov2-base

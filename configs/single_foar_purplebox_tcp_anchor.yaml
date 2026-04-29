@@ -5,6 +5,10 @@ data:
   num_action: 20
   voxel_size: 0.005
   calib_timestamp: single_foar_purplebox
+  vis: false
+  vis_save_dir: /data/haoxiang/logs/single_foar_purplebox_tcp_anchor_vis
+  vis_save_png: false
+  vis_save_ply: false
 
   sample_traj:
     enable: true
@@ -28,7 +32,6 @@ data:
     img_coord_size_dinov3: [18, 32]
 
   repeat_dataset: 1
-  vis: false
   vis_force_offscreen: true
 
 train:
@@ -48,7 +51,7 @@ train:
     aug_color_prob: 0.2
 
   lr: 0.0003
-  batch_size: 180
+  batch_size: 160
   num_workers: 24
   num_steps: 60000
   save_steps: 2500
@@ -66,10 +69,8 @@ deploy:
     inhand_camera_serial: unknown_inhand
     gripper_port: /dev/ttyUSB0
     gripper_key: width
-    enable_init_tcp_pose: false
-    gripper_self_test: false
 
-  max_steps: 1
+  max_steps: 3000
   num_inference_steps: 20
   gripper_threshold: 0.02
   ensemble_mode: new
@@ -78,30 +79,31 @@ deploy:
 
 mask_aware:
   enabled: true
+  mask_root: /data/haoxiang/data/zihao_foar2/flip_0326_purple_box_merged_masks
+  align_mode: sorted_index
   enable_2d_reweight: true
   enable_3d_filter: true
   mask_threshold: 0
   mask_white_is_untrusted: true
-  debug_save_mask: true
-  debug_save_every: 1
-  debug_dir: /data/haoxiang/logs/single_foar_purplebox_mask_aware/eval_json_debug_masks
-  debug_print_stats: true
   r_min: 0.001
   interp_eps: 0.000001
   interp_tiny: 0.000001
-  empty_cloud_policy: warn_and_skip_filter
+  empty_cloud_policy: warn_and_skip
+  log_alignment_preview: true
 
-  json_mask:
-    single_json: /data/haoxiang/data/zihao_foar2/flip_0326_purple_box/calib/result.json
-    cam_base_mode: base_to_cam__predef
-    use_agent_intrinsics: true
-    intrinsics_npy: null
-    intrinsic_selector: first
-    single_urdf: airexo/airexo/urdf_models/zihao_single_worldbase_y_neg90/left_robot.urdf
-    width: 1280
-    height: 720
-    near_plane: 0.01
-    far_plane: 100.0
+tcp_anchor:
+  enabled: true
+  remove_arm_from_cloud: true
+  arm_mask_root: /data/haoxiang/data/zihao_foar2/flip_0326_purple_box_masks_raw
+  arm_mask_subdir: arm
+  arm_mask_dilate_kernel: 9
+  anchor_num_points: 7
+  anchor_radius_scale: 0.75
+  anchor_color: [0.0, 0.2, 1.0]
+  fail_if_missing_arm_mask: true
+  patch_weight_mode: anchor_only
+  tcp_patch_radius: 1
+  tcp_patch_weight_floor: 1.0
 
 model:
   image_enc: dinov2-base
